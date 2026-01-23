@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<meta name="author" content="Gilles Colling" />
+
+<meta name="date" content="2026-01-19" />
+
+<title>Common Join Issues and Solutions</title>
+
+<script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
+// be compatible with the behavior of Pandoc < 2.8).
+document.addEventListener('DOMContentLoaded', function(e) {
+  var hs = document.querySelectorAll("div.section[class*='level'] > :first-child");
+  var i, h, a;
+  for (i = 0; i < hs.length; i++) {
+    h = hs[i];
+    if (!/^h[1-6]$/i.test(h.tagName)) continue;  // it should be a header h1-h6
+    a = h.attributes;
+    while (a.length > 0) h.removeAttribute(a[0].name);
+  }
+});
+</script>
+
+<style type="text/css">
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+span.underline{text-decoration: underline;}
+div.column{display: inline-block; vertical-align: top; width: 50%;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+</style>
+
+
+
+<style type="text/css">
+code {
+white-space: pre;
+}
+.sourceCode {
+overflow: visible;
+}
+</style>
+<style type="text/css" data-origin="pandoc">
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+<script>
+// apply pandoc div.sourceCode style to pre.sourceCode instead
+(function() {
+  var sheets = document.styleSheets;
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].ownerNode.dataset["origin"] !== "pandoc") continue;
+    try { var rules = sheets[i].cssRules; } catch (e) { continue; }
+    var j = 0;
+    while (j < rules.length) {
+      var rule = rules[j];
+      // check if there is a div.sourceCode rule
+      if (rule.type !== rule.STYLE_RULE || rule.selectorText !== "div.sourceCode") {
+        j++;
+        continue;
+      }
+      var style = rule.style.cssText;
+      // check if color or background-color is set
+      if (rule.style.color === '' && rule.style.backgroundColor === '') {
+        j++;
+        continue;
+      }
+      // replace div.sourceCode by a pre.sourceCode rule
+      sheets[i].deleteRule(j);
+      sheets[i].insertRule('pre.sourceCode{' + style + '}', j);
+    }
+  }
+})();
+</script>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+#TOC {
+clear: both;
+margin: 0 0 10px 10px;
+padding: 4px;
+width: 400px;
+border: 1px solid #CCCCCC;
+border-radius: 5px;
+background-color: #f6f6f6;
+font-size: 13px;
+line-height: 1.3;
+}
+#TOC .toctitle {
+font-weight: bold;
+font-size: 15px;
+margin-left: 5px;
+}
+#TOC ul {
+padding-left: 40px;
+margin-left: -1.5em;
+margin-top: 5px;
+margin-bottom: 5px;
+}
+#TOC ul ul {
+margin-left: -2em;
+}
+#TOC li {
+line-height: 16px;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+
+code > span.kw { color: #555; font-weight: bold; } 
+code > span.dt { color: #902000; } 
+code > span.dv { color: #40a070; } 
+code > span.bn { color: #d14; } 
+code > span.fl { color: #d14; } 
+code > span.ch { color: #d14; } 
+code > span.st { color: #d14; } 
+code > span.co { color: #888888; font-style: italic; } 
+code > span.ot { color: #007020; } 
+code > span.al { color: #ff0000; font-weight: bold; } 
+code > span.fu { color: #900; font-weight: bold; } 
+code > span.er { color: #a61717; background-color: #e3d2d2; } 
+</style>
+
+
+
+
+</head>
+
+<body>
+
+
+
+
+<h1 class="title toc-ignore">Common Join Issues and Solutions</h1>
+<h4 class="author">Gilles Colling</h4>
+<h4 class="date">2026-01-19</h4>
+
+
+
+<div id="overview" class="section level2">
+<h2>Overview</h2>
+<p>This vignette catalogs common join problems and shows how joinspy
+detects and resolves them. Each issue includes detection methods and
+recommended solutions.</p>
+</div>
+<div id="issue-1-duplicate-keys" class="section level2">
+<h2>Issue 1: Duplicate Keys</h2>
+<p><strong>Problem</strong>: When one or both tables have duplicate
+keys, joins multiply rows unexpectedly.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>, <span class="dv">3</span>),</span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">100</span>, <span class="dv">50</span>, <span class="dv">75</span>, <span class="dv">200</span>)</span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a>)</span>
+<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a>addresses <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb1-7"><a href="#cb1-7" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>, <span class="dv">3</span>),</span>
+<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a>  <span class="at">address =</span> <span class="fu">c</span>(<span class="st">&quot;NYC&quot;</span>, <span class="st">&quot;LA&quot;</span>, <span class="st">&quot;SF&quot;</span>, <span class="st">&quot;Chicago&quot;</span>)</span>
+<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a>)</span>
+<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a><span class="fu">join_spy</span>(orders, addresses, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb1-14"><a href="#cb1-14" tabindex="-1"></a><span class="co">#&gt; Join columns: customer_id</span></span>
+<span id="cb1-15"><a href="#cb1-15" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-16"><a href="#cb1-16" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb1-17"><a href="#cb1-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-18"><a href="#cb1-18" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 4 Unique keys: 3 Duplicate keys: 1 NA keys: 0</span></span>
+<span id="cb1-19"><a href="#cb1-19" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 4 Unique keys: 3 Duplicate keys: 1 NA keys: 0</span></span>
+<span id="cb1-20"><a href="#cb1-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-21"><a href="#cb1-21" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb1-22"><a href="#cb1-22" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-23"><a href="#cb1-23" tabindex="-1"></a><span class="co">#&gt; Keys in both: 3</span></span>
+<span id="cb1-24"><a href="#cb1-24" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 0</span></span>
+<span id="cb1-25"><a href="#cb1-25" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 0</span></span>
+<span id="cb1-26"><a href="#cb1-26" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;100%&quot;</span></span>
+<span id="cb1-27"><a href="#cb1-27" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-28"><a href="#cb1-28" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb1-29"><a href="#cb1-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-30"><a href="#cb1-30" tabindex="-1"></a><span class="co">#&gt; ! Left table has 1 duplicate key(s) affecting 2 rows - may cause row multiplication</span></span>
+<span id="cb1-31"><a href="#cb1-31" tabindex="-1"></a><span class="co">#&gt; ! Right table has 1 duplicate key(s) affecting 2 rows - may cause row multiplication</span></span>
+<span id="cb1-32"><a href="#cb1-32" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-33"><a href="#cb1-33" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb1-34"><a href="#cb1-34" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb1-35"><a href="#cb1-35" tabindex="-1"></a><span class="co">#&gt; inner_join: 6</span></span>
+<span id="cb1-36"><a href="#cb1-36" tabindex="-1"></a><span class="co">#&gt; left_join: 6</span></span>
+<span id="cb1-37"><a href="#cb1-37" tabindex="-1"></a><span class="co">#&gt; right_join: 6</span></span>
+<span id="cb1-38"><a href="#cb1-38" tabindex="-1"></a><span class="co">#&gt; full_join: 6</span></span></code></pre></div>
+<p><strong>Detection</strong>: <code>join_spy()</code> reports duplicate
+counts and expected row multiplication.</p>
+<p><strong>Solution</strong>: Aggregate or filter duplicates before
+joining.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="fu">key_duplicates</span>(orders, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a><span class="co">#&gt;   customer_id amount .n_duplicates</span></span>
+<span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a><span class="co">#&gt; 2           2     50             2</span></span>
+<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a><span class="co">#&gt; 3           2     75             2</span></span>
+<span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a><span class="fu">key_duplicates</span>(addresses, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb2-6"><a href="#cb2-6" tabindex="-1"></a><span class="co">#&gt;   customer_id address .n_duplicates</span></span>
+<span id="cb2-7"><a href="#cb2-7" tabindex="-1"></a><span class="co">#&gt; 2           2      LA             2</span></span>
+<span id="cb2-8"><a href="#cb2-8" tabindex="-1"></a><span class="co">#&gt; 3           2      SF             2</span></span></code></pre></div>
+</div>
+<div id="issue-2-whitespace" class="section level2">
+<h2>Issue 2: Whitespace</h2>
+<p><strong>Problem</strong>: Invisible leading/trailing spaces prevent
+matches.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>sales <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>  <span class="at">product =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Gadget &quot;</span>, <span class="st">&quot; Gizmo&quot;</span>),</span>
+<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>  <span class="at">units =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>),</span>
+<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb3-5"><a href="#cb3-5" tabindex="-1"></a>)</span>
+<span id="cb3-6"><a href="#cb3-6" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" tabindex="-1"></a>inventory <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb3-8"><a href="#cb3-8" tabindex="-1"></a>  <span class="at">product =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Gadget&quot;</span>, <span class="st">&quot;Gizmo&quot;</span>),</span>
+<span id="cb3-9"><a href="#cb3-9" tabindex="-1"></a>  <span class="at">stock =</span> <span class="fu">c</span>(<span class="dv">100</span>, <span class="dv">200</span>, <span class="dv">300</span>),</span>
+<span id="cb3-10"><a href="#cb3-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb3-11"><a href="#cb3-11" tabindex="-1"></a>)</span>
+<span id="cb3-12"><a href="#cb3-12" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" tabindex="-1"></a><span class="fu">join_spy</span>(sales, inventory, <span class="at">by =</span> <span class="st">&quot;product&quot;</span>)</span>
+<span id="cb3-14"><a href="#cb3-14" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-15"><a href="#cb3-15" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb3-16"><a href="#cb3-16" tabindex="-1"></a><span class="co">#&gt; Join columns: product</span></span>
+<span id="cb3-17"><a href="#cb3-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-18"><a href="#cb3-18" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb3-19"><a href="#cb3-19" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-20"><a href="#cb3-20" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb3-21"><a href="#cb3-21" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb3-22"><a href="#cb3-22" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-23"><a href="#cb3-23" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb3-24"><a href="#cb3-24" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-25"><a href="#cb3-25" tabindex="-1"></a><span class="co">#&gt; Keys in both: 1</span></span>
+<span id="cb3-26"><a href="#cb3-26" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 2</span></span>
+<span id="cb3-27"><a href="#cb3-27" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 2</span></span>
+<span id="cb3-28"><a href="#cb3-28" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;33.3%&quot;</span></span>
+<span id="cb3-29"><a href="#cb3-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-30"><a href="#cb3-30" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb3-31"><a href="#cb3-31" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-32"><a href="#cb3-32" tabindex="-1"></a><span class="co">#&gt; ! Left column &#39;product&#39; has 2 value(s) with leading/trailing whitespace</span></span>
+<span id="cb3-33"><a href="#cb3-33" tabindex="-1"></a><span class="co">#&gt; ℹ 2 near-match(es) found (e.g., &#39;Gadget &#39; ~ &#39;Gadget&#39;, &#39; Gizmo&#39; ~ &#39;Gizmo&#39;) - possible typos?</span></span>
+<span id="cb3-34"><a href="#cb3-34" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-35"><a href="#cb3-35" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb3-36"><a href="#cb3-36" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb3-37"><a href="#cb3-37" tabindex="-1"></a><span class="co">#&gt; inner_join: 1</span></span>
+<span id="cb3-38"><a href="#cb3-38" tabindex="-1"></a><span class="co">#&gt; left_join: 3</span></span>
+<span id="cb3-39"><a href="#cb3-39" tabindex="-1"></a><span class="co">#&gt; right_join: 3</span></span>
+<span id="cb3-40"><a href="#cb3-40" tabindex="-1"></a><span class="co">#&gt; full_join: 5</span></span></code></pre></div>
+<p><strong>Detection</strong>: <code>join_spy()</code> flags whitespace
+issues in the Issues section.</p>
+<p><strong>Solution</strong>: Use <code>join_repair()</code> or
+<code>trimws()</code>.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>sales_fixed <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(sales, <span class="at">by =</span> <span class="st">&quot;product&quot;</span>)</span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a><span class="fu">key_check</span>(sales_fixed, inventory, <span class="at">by =</span> <span class="st">&quot;product&quot;</span>)</span>
+<span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a><span class="co">#&gt; ✔ Key check passed: no issues detected</span></span></code></pre></div>
+</div>
+<div id="issue-3-case-mismatches" class="section level2">
+<h2>Issue 3: Case Mismatches</h2>
+<p><strong>Problem</strong>: Keys differ only by case (“ABC” vs
+“abc”).</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a>left <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;ABC&quot;</span>, <span class="st">&quot;def&quot;</span>, <span class="st">&quot;GHI&quot;</span>),</span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>,</span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a>)</span>
+<span id="cb5-6"><a href="#cb5-6" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" tabindex="-1"></a>right <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb5-8"><a href="#cb5-8" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;abc&quot;</span>, <span class="st">&quot;DEF&quot;</span>, <span class="st">&quot;ghi&quot;</span>),</span>
+<span id="cb5-9"><a href="#cb5-9" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;D&quot;</span>, <span class="st">&quot;G&quot;</span>),</span>
+<span id="cb5-10"><a href="#cb5-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb5-11"><a href="#cb5-11" tabindex="-1"></a>)</span>
+<span id="cb5-12"><a href="#cb5-12" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" tabindex="-1"></a><span class="fu">join_spy</span>(left, right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
+<span id="cb5-14"><a href="#cb5-14" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-15"><a href="#cb5-15" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb5-16"><a href="#cb5-16" tabindex="-1"></a><span class="co">#&gt; Join columns: code</span></span>
+<span id="cb5-17"><a href="#cb5-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-18"><a href="#cb5-18" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb5-19"><a href="#cb5-19" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-20"><a href="#cb5-20" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb5-21"><a href="#cb5-21" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb5-22"><a href="#cb5-22" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-23"><a href="#cb5-23" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb5-24"><a href="#cb5-24" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-25"><a href="#cb5-25" tabindex="-1"></a><span class="co">#&gt; Keys in both: 0</span></span>
+<span id="cb5-26"><a href="#cb5-26" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 3</span></span>
+<span id="cb5-27"><a href="#cb5-27" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 3</span></span>
+<span id="cb5-28"><a href="#cb5-28" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;0%&quot;</span></span>
+<span id="cb5-29"><a href="#cb5-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-30"><a href="#cb5-30" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb5-31"><a href="#cb5-31" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-32"><a href="#cb5-32" tabindex="-1"></a><span class="co">#&gt; ! 3 key(s) would match if case-insensitive (e.g., &#39;ABC&#39; vs &#39;abc&#39;)</span></span>
+<span id="cb5-33"><a href="#cb5-33" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-34"><a href="#cb5-34" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb5-35"><a href="#cb5-35" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb5-36"><a href="#cb5-36" tabindex="-1"></a><span class="co">#&gt; inner_join: 0</span></span>
+<span id="cb5-37"><a href="#cb5-37" tabindex="-1"></a><span class="co">#&gt; left_join: 3</span></span>
+<span id="cb5-38"><a href="#cb5-38" tabindex="-1"></a><span class="co">#&gt; right_join: 3</span></span>
+<span id="cb5-39"><a href="#cb5-39" tabindex="-1"></a><span class="co">#&gt; full_join: 6</span></span></code></pre></div>
+<p><strong>Detection</strong>: <code>join_spy()</code> detects case
+mismatches when keys would match if case-insensitive.</p>
+<p><strong>Solution</strong>: Standardize case with
+<code>join_repair()</code>.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(left, right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">standardize_case =</span> <span class="st">&quot;upper&quot;</span>)</span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 3 value(s)</span></span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a><span class="fu">key_check</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a><span class="co">#&gt; ✔ Key check passed: no issues detected</span></span></code></pre></div>
+</div>
+<div id="issue-4-na-keys" class="section level2">
+<h2>Issue 4: NA Keys</h2>
+<p><strong>Problem</strong>: NA values in key columns never match (by
+design in R).</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="cn">NA</span>, <span class="dv">3</span>, <span class="cn">NA</span>),</span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">100</span>, <span class="dv">200</span>, <span class="dv">300</span>, <span class="dv">400</span>)</span>
+<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a>)</span>
+<span id="cb7-5"><a href="#cb7-5" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" tabindex="-1"></a>customers <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb7-7"><a href="#cb7-7" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>, <span class="cn">NA</span>),</span>
+<span id="cb7-8"><a href="#cb7-8" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Alice&quot;</span>, <span class="st">&quot;Bob&quot;</span>, <span class="st">&quot;Carol&quot;</span>, <span class="st">&quot;Unknown&quot;</span>)</span>
+<span id="cb7-9"><a href="#cb7-9" tabindex="-1"></a>)</span>
+<span id="cb7-10"><a href="#cb7-10" tabindex="-1"></a></span>
+<span id="cb7-11"><a href="#cb7-11" tabindex="-1"></a><span class="fu">join_spy</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb7-12"><a href="#cb7-12" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-13"><a href="#cb7-13" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb7-14"><a href="#cb7-14" tabindex="-1"></a><span class="co">#&gt; Join columns: customer_id</span></span>
+<span id="cb7-15"><a href="#cb7-15" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-16"><a href="#cb7-16" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb7-17"><a href="#cb7-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-18"><a href="#cb7-18" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 4 Unique keys: 2 Duplicate keys: 0 NA keys: 2</span></span>
+<span id="cb7-19"><a href="#cb7-19" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 4 Unique keys: 3 Duplicate keys: 0 NA keys: 1</span></span>
+<span id="cb7-20"><a href="#cb7-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-21"><a href="#cb7-21" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb7-22"><a href="#cb7-22" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-23"><a href="#cb7-23" tabindex="-1"></a><span class="co">#&gt; Keys in both: 2</span></span>
+<span id="cb7-24"><a href="#cb7-24" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 0</span></span>
+<span id="cb7-25"><a href="#cb7-25" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 1</span></span>
+<span id="cb7-26"><a href="#cb7-26" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;100%&quot;</span></span>
+<span id="cb7-27"><a href="#cb7-27" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-28"><a href="#cb7-28" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb7-29"><a href="#cb7-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-30"><a href="#cb7-30" tabindex="-1"></a><span class="co">#&gt; ! Left table has 2 NA key(s) - these will not match</span></span>
+<span id="cb7-31"><a href="#cb7-31" tabindex="-1"></a><span class="co">#&gt; ! Right table has 1 NA key(s) - these will not match</span></span>
+<span id="cb7-32"><a href="#cb7-32" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-33"><a href="#cb7-33" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb7-34"><a href="#cb7-34" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb7-35"><a href="#cb7-35" tabindex="-1"></a><span class="co">#&gt; inner_join: 2</span></span>
+<span id="cb7-36"><a href="#cb7-36" tabindex="-1"></a><span class="co">#&gt; left_join: 4</span></span>
+<span id="cb7-37"><a href="#cb7-37" tabindex="-1"></a><span class="co">#&gt; right_join: 4</span></span>
+<span id="cb7-38"><a href="#cb7-38" tabindex="-1"></a><span class="co">#&gt; full_join: 6</span></span></code></pre></div>
+<p><strong>Detection</strong>: <code>join_spy()</code> reports NA counts
+in the Table Summary.</p>
+<p><strong>Solution</strong>: Handle NA values explicitly—remove them or
+replace with a placeholder.</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a><span class="co"># Option 1: Remove rows with NA keys</span></span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>orders_clean <span class="ot">&lt;-</span> orders[<span class="sc">!</span><span class="fu">is.na</span>(orders<span class="sc">$</span>customer_id), ]</span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="co"># Option 2: Replace NA with placeholder</span></span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a>orders<span class="sc">$</span>customer_id[<span class="fu">is.na</span>(orders<span class="sc">$</span>customer_id)] <span class="ot">&lt;-</span> <span class="sc">-</span><span class="dv">999</span></span></code></pre></div>
+</div>
+<div id="issue-5-no-matches" class="section level2">
+<h2>Issue 5: No Matches</h2>
+<p><strong>Problem</strong>: Inner join returns zero rows when you
+expected matches.</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>system_a <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>  <span class="at">user_id =</span> <span class="fu">c</span>(<span class="st">&quot;USR001&quot;</span>, <span class="st">&quot;USR002&quot;</span>, <span class="st">&quot;USR003&quot;</span>),</span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>  <span class="at">score =</span> <span class="fu">c</span>(<span class="dv">85</span>, <span class="dv">90</span>, <span class="dv">78</span>),</span>
+<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a>)</span>
+<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" tabindex="-1"></a>system_b <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb9-8"><a href="#cb9-8" tabindex="-1"></a>  <span class="at">user_id =</span> <span class="fu">c</span>(<span class="st">&quot;1&quot;</span>, <span class="st">&quot;2&quot;</span>, <span class="st">&quot;3&quot;</span>),</span>
+<span id="cb9-9"><a href="#cb9-9" tabindex="-1"></a>  <span class="at">department =</span> <span class="fu">c</span>(<span class="st">&quot;Sales&quot;</span>, <span class="st">&quot;Marketing&quot;</span>, <span class="st">&quot;Engineering&quot;</span>),</span>
+<span id="cb9-10"><a href="#cb9-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb9-11"><a href="#cb9-11" tabindex="-1"></a>)</span>
+<span id="cb9-12"><a href="#cb9-12" tabindex="-1"></a></span>
+<span id="cb9-13"><a href="#cb9-13" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(system_a, system_b, <span class="at">by =</span> <span class="st">&quot;user_id&quot;</span>)</span></code></pre></div>
+<p><strong>Detection</strong>: Match analysis shows 0% match rate.</p>
+<p><strong>Solution</strong>: Create a mapping table or transform keys
+to a common format.</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a><span class="co"># Extract numeric part</span></span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>system_a<span class="sc">$</span>user_num <span class="ot">&lt;-</span> <span class="fu">gsub</span>(<span class="st">&quot;USR0*&quot;</span>, <span class="st">&quot;&quot;</span>, system_a<span class="sc">$</span>user_id)</span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a><span class="fu">key_check</span>(system_a, system_b, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;user_num&quot;</span> <span class="ot">=</span> <span class="st">&quot;user_id&quot;</span>))</span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a><span class="co">#&gt; ✔ Key check passed: no issues detected</span></span></code></pre></div>
+</div>
+<div id="issue-6-many-to-many-explosion" class="section level2">
+<h2>Issue 6: Many-to-Many Explosion</h2>
+<p><strong>Problem</strong>: Both tables have duplicate keys, causing
+exponential row growth.</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a>order_items <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>  <span class="at">item =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>, <span class="st">&quot;C&quot;</span>, <span class="st">&quot;D&quot;</span>, <span class="st">&quot;E&quot;</span>)</span>
+<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>)</span>
+<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a>order_payments <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span id="cb11-8"><a href="#cb11-8" tabindex="-1"></a>  <span class="at">payment =</span> <span class="fu">c</span>(<span class="st">&quot;CC1&quot;</span>, <span class="st">&quot;CC2&quot;</span>, <span class="st">&quot;Cash&quot;</span>, <span class="st">&quot;Check&quot;</span>)</span>
+<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a>)</span>
+<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(order_items, order_payments, <span class="at">by =</span> <span class="st">&quot;order_id&quot;</span>)</span></code></pre></div>
+<p><strong>Detection</strong>: Expected row counts show multiplication
+(inner join = 10 rows from 9 source rows).</p>
+<p><strong>Solution</strong>: Aggregate one table first, or use
+<code>check_cartesian()</code>.</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a><span class="fu">check_cartesian</span>(order_items, order_payments, <span class="at">by =</span> <span class="st">&quot;order_id&quot;</span>)</span>
+<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a><span class="co">#&gt; ✔ No Cartesian product risk (expansion factor: 2x)</span></span></code></pre></div>
+<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a><span class="co"># Enforce cardinality to catch this</span></span>
+<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a><span class="fu">join_strict</span>(order_items, order_payments, <span class="at">by =</span> <span class="st">&quot;order_id&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:m&quot;</span>)</span>
+<span id="cb13-3"><a href="#cb13-3" tabindex="-1"></a><span class="co">#&gt; Error:</span></span>
+<span id="cb13-4"><a href="#cb13-4" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected 1:m but found m:m</span></span>
+<span id="cb13-5"><a href="#cb13-5" tabindex="-1"></a><span class="co">#&gt;   Left duplicates: 2, Right duplicates: 2</span></span></code></pre></div>
+</div>
+<div id="issue-7-type-mismatches" class="section level2">
+<h2>Issue 7: Type Mismatches</h2>
+<p><strong>Problem</strong>: Keys have different types (numeric vs
+character).</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb14-2"><a href="#cb14-2" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>),</span>
+<span id="cb14-3"><a href="#cb14-3" tabindex="-1"></a>  <span class="at">quantity =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>)</span>
+<span id="cb14-4"><a href="#cb14-4" tabindex="-1"></a>)</span>
+<span id="cb14-5"><a href="#cb14-5" tabindex="-1"></a></span>
+<span id="cb14-6"><a href="#cb14-6" tabindex="-1"></a>products <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb14-7"><a href="#cb14-7" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;1&quot;</span>, <span class="st">&quot;2&quot;</span>, <span class="st">&quot;3&quot;</span>),</span>
+<span id="cb14-8"><a href="#cb14-8" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Gadget&quot;</span>, <span class="st">&quot;Gizmo&quot;</span>),</span>
+<span id="cb14-9"><a href="#cb14-9" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb14-10"><a href="#cb14-10" tabindex="-1"></a>)</span>
+<span id="cb14-11"><a href="#cb14-11" tabindex="-1"></a></span>
+<span id="cb14-12"><a href="#cb14-12" tabindex="-1"></a><span class="fu">join_spy</span>(orders, products, <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>)</span>
+<span id="cb14-13"><a href="#cb14-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-14"><a href="#cb14-14" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb14-15"><a href="#cb14-15" tabindex="-1"></a><span class="co">#&gt; Join columns: product_id</span></span>
+<span id="cb14-16"><a href="#cb14-16" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-17"><a href="#cb14-17" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb14-18"><a href="#cb14-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-19"><a href="#cb14-19" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb14-20"><a href="#cb14-20" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb14-21"><a href="#cb14-21" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-22"><a href="#cb14-22" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb14-23"><a href="#cb14-23" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-24"><a href="#cb14-24" tabindex="-1"></a><span class="co">#&gt; Keys in both: 3</span></span>
+<span id="cb14-25"><a href="#cb14-25" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 0</span></span>
+<span id="cb14-26"><a href="#cb14-26" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 0</span></span>
+<span id="cb14-27"><a href="#cb14-27" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;100%&quot;</span></span>
+<span id="cb14-28"><a href="#cb14-28" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-29"><a href="#cb14-29" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb14-30"><a href="#cb14-30" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-31"><a href="#cb14-31" tabindex="-1"></a><span class="co">#&gt; ! Type mismatch: &#39;product_id&#39; is numeric, &#39;product_id&#39; is character - may cause unexpected results</span></span>
+<span id="cb14-32"><a href="#cb14-32" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-33"><a href="#cb14-33" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb14-34"><a href="#cb14-34" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb14-35"><a href="#cb14-35" tabindex="-1"></a><span class="co">#&gt; inner_join: 3</span></span>
+<span id="cb14-36"><a href="#cb14-36" tabindex="-1"></a><span class="co">#&gt; left_join: 3</span></span>
+<span id="cb14-37"><a href="#cb14-37" tabindex="-1"></a><span class="co">#&gt; right_join: 3</span></span>
+<span id="cb14-38"><a href="#cb14-38" tabindex="-1"></a><span class="co">#&gt; full_join: 3</span></span></code></pre></div>
+<p><strong>Detection</strong>: <code>join_spy()</code> flags type
+coercion warnings.</p>
+<p><strong>Solution</strong>: Convert to matching types before
+joining.</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a>orders<span class="sc">$</span>product_id <span class="ot">&lt;-</span> <span class="fu">as.character</span>(orders<span class="sc">$</span>product_id)</span>
+<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a><span class="fu">key_check</span>(orders, products, <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>)</span>
+<span id="cb15-3"><a href="#cb15-3" tabindex="-1"></a><span class="co">#&gt; ✔ Key check passed: no issues detected</span></span></code></pre></div>
+</div>
+<div id="issue-8-empty-strings-vs-na" class="section level2">
+<h2>Issue 8: Empty Strings vs NA</h2>
+<p><strong>Problem</strong>: Empty strings (<code>&quot;&quot;</code>) and
+<code>NA</code> behave differently in joins.</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a>left <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb16-2"><a href="#cb16-2" tabindex="-1"></a>  <span class="at">id =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;&quot;</span>, <span class="st">&quot;C&quot;</span>),</span>
+<span id="cb16-3"><a href="#cb16-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>,</span>
+<span id="cb16-4"><a href="#cb16-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb16-5"><a href="#cb16-5" tabindex="-1"></a>)</span>
+<span id="cb16-6"><a href="#cb16-6" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" tabindex="-1"></a>right <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb16-8"><a href="#cb16-8" tabindex="-1"></a>  <span class="at">id =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>, <span class="st">&quot;&quot;</span>),</span>
+<span id="cb16-9"><a href="#cb16-9" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Empty&quot;</span>),</span>
+<span id="cb16-10"><a href="#cb16-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb16-11"><a href="#cb16-11" tabindex="-1"></a>)</span>
+<span id="cb16-12"><a href="#cb16-12" tabindex="-1"></a></span>
+<span id="cb16-13"><a href="#cb16-13" tabindex="-1"></a><span class="fu">join_spy</span>(left, right, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>)</span>
+<span id="cb16-14"><a href="#cb16-14" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-15"><a href="#cb16-15" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb16-16"><a href="#cb16-16" tabindex="-1"></a><span class="co">#&gt; Join columns: id</span></span>
+<span id="cb16-17"><a href="#cb16-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-18"><a href="#cb16-18" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb16-19"><a href="#cb16-19" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-20"><a href="#cb16-20" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb16-21"><a href="#cb16-21" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 3 Unique keys: 3 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb16-22"><a href="#cb16-22" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-23"><a href="#cb16-23" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb16-24"><a href="#cb16-24" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-25"><a href="#cb16-25" tabindex="-1"></a><span class="co">#&gt; Keys in both: 2</span></span>
+<span id="cb16-26"><a href="#cb16-26" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 1</span></span>
+<span id="cb16-27"><a href="#cb16-27" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 1</span></span>
+<span id="cb16-28"><a href="#cb16-28" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;66.7%&quot;</span></span>
+<span id="cb16-29"><a href="#cb16-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-30"><a href="#cb16-30" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb16-31"><a href="#cb16-31" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-32"><a href="#cb16-32" tabindex="-1"></a><span class="co">#&gt; ℹ Left column &#39;id&#39; has 1 empty string(s) - these match other empty strings but not NA</span></span>
+<span id="cb16-33"><a href="#cb16-33" tabindex="-1"></a><span class="co">#&gt; ℹ Right column &#39;id&#39; has 1 empty string(s) - these match other empty strings but not NA</span></span>
+<span id="cb16-34"><a href="#cb16-34" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-35"><a href="#cb16-35" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb16-36"><a href="#cb16-36" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb16-37"><a href="#cb16-37" tabindex="-1"></a><span class="co">#&gt; inner_join: NA</span></span>
+<span id="cb16-38"><a href="#cb16-38" tabindex="-1"></a><span class="co">#&gt; left_join: NA</span></span>
+<span id="cb16-39"><a href="#cb16-39" tabindex="-1"></a><span class="co">#&gt; right_join: NA</span></span>
+<span id="cb16-40"><a href="#cb16-40" tabindex="-1"></a><span class="co">#&gt; full_join: NA</span></span></code></pre></div>
+<p><strong>Detection</strong>: <code>join_spy()</code> warns about empty
+strings in keys.</p>
+<p><strong>Solution</strong>: Convert empty strings to NA with
+<code>join_repair()</code>.</p>
+<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a>left_fixed <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(left, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">empty_to_na =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb17-2"><a href="#cb17-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 1 value(s)</span></span>
+<span id="cb17-3"><a href="#cb17-3" tabindex="-1"></a>left_fixed<span class="sc">$</span>id</span>
+<span id="cb17-4"><a href="#cb17-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;A&quot; NA  &quot;C&quot;</span></span></code></pre></div>
+</div>
+<div id="using-join_strict-for-safety" class="section level2">
+<h2>Using join_strict() for Safety</h2>
+<p>When you know the expected cardinality, use
+<code>join_strict()</code> to fail fast:</p>
+<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" tabindex="-1"></a>products <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>, <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>, <span class="st">&quot;C&quot;</span>))</span>
+<span id="cb18-2"><a href="#cb18-2" tabindex="-1"></a>prices <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>, <span class="dv">3</span>), <span class="at">price =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">25</span>, <span class="dv">30</span>))</span>
+<span id="cb18-3"><a href="#cb18-3" tabindex="-1"></a></span>
+<span id="cb18-4"><a href="#cb18-4" tabindex="-1"></a><span class="fu">join_strict</span>(products, prices, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:1&quot;</span>)</span>
+<span id="cb18-5"><a href="#cb18-5" tabindex="-1"></a><span class="co">#&gt; Error:</span></span>
+<span id="cb18-6"><a href="#cb18-6" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected 1:1 but found 1:m</span></span>
+<span id="cb18-7"><a href="#cb18-7" tabindex="-1"></a><span class="co">#&gt;   Left duplicates: 0, Right duplicates: 1</span></span></code></pre></div>
+</div>
+<div id="automatic-detection-with-detect_cardinality" class="section level2">
+<h2>Automatic Detection with detect_cardinality()</h2>
+<p>Let joinspy determine the actual relationship:</p>
+<div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>), <span class="at">item =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>, <span class="st">&quot;C&quot;</span>, <span class="st">&quot;D&quot;</span>))</span>
+<span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a>customers <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>, <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Alice&quot;</span>, <span class="st">&quot;Bob&quot;</span>, <span class="st">&quot;Carol&quot;</span>))</span>
+<span id="cb19-3"><a href="#cb19-3" tabindex="-1"></a></span>
+<span id="cb19-4"><a href="#cb19-4" tabindex="-1"></a><span class="fu">detect_cardinality</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>)</span>
+<span id="cb19-5"><a href="#cb19-5" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;m:1&quot;</span></span>
+<span id="cb19-6"><a href="#cb19-6" tabindex="-1"></a><span class="co">#&gt; Left duplicates: 1 key(s)</span></span></code></pre></div>
+</div>
+<div id="quick-reference" class="section level2">
+<h2>Quick Reference</h2>
+<table>
+<colgroup>
+<col width="25%" />
+<col width="39%" />
+<col width="35%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Issue</th>
+<th>Detection</th>
+<th>Solution</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Duplicates</td>
+<td><code>join_spy()</code>, <code>key_duplicates()</code></td>
+<td>Aggregate or filter</td>
+</tr>
+<tr class="even">
+<td>Whitespace</td>
+<td><code>join_spy()</code>, <code>key_check()</code></td>
+<td><code>join_repair()</code>, <code>trimws()</code></td>
+</tr>
+<tr class="odd">
+<td>Case mismatch</td>
+<td><code>join_spy()</code></td>
+<td><code>join_repair(standardize_case=)</code></td>
+</tr>
+<tr class="even">
+<td>NA keys</td>
+<td><code>join_spy()</code> Table Summary</td>
+<td>Remove or replace</td>
+</tr>
+<tr class="odd">
+<td>No matches</td>
+<td><code>join_spy()</code> Match Analysis</td>
+<td>Check key format/mapping</td>
+</tr>
+<tr class="even">
+<td>M:M explosion</td>
+<td><code>join_spy()</code>, <code>check_cartesian()</code></td>
+<td>Aggregate first</td>
+</tr>
+<tr class="odd">
+<td>Type mismatch</td>
+<td><code>join_spy()</code></td>
+<td>Convert types</td>
+</tr>
+<tr class="even">
+<td>Empty strings</td>
+<td><code>join_spy()</code></td>
+<td><code>join_repair(empty_to_na=TRUE)</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="troubleshooting-workflow" class="section level2">
+<h2>Troubleshooting Workflow</h2>
+<ol style="list-style-type: decimal">
+<li>Run <code>join_spy(x, y, by)</code> to get a comprehensive
+diagnostic</li>
+<li>Check the Issues section for detected problems</li>
+<li>Use <code>key_duplicates()</code> to locate specific duplicate
+rows</li>
+<li>Apply <code>join_repair()</code> to fix whitespace/case/encoding
+issues</li>
+<li>Use <code>join_strict()</code> to enforce expected cardinality</li>
+<li>After joining, use <code>join_explain()</code> to understand row
+count changes</li>
+</ol>
+</div>
+<div id="see-also" class="section level2">
+<h2>See Also</h2>
+<ul>
+<li><code>vignette(&quot;introduction&quot;)</code> - Getting started guide</li>
+<li><code>?join_spy</code>, <code>?key_check</code>,
+<code>?join_repair</code>, <code>?join_strict</code></li>
+<li><code>?check_cartesian</code>, <code>?detect_cardinality</code></li>
+</ul>
+</div>
+<div id="session-info" class="section level2">
+<h2>Session Info</h2>
+<div class="sourceCode" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" tabindex="-1"></a><span class="fu">sessionInfo</span>()</span>
+<span id="cb20-2"><a href="#cb20-2" tabindex="-1"></a><span class="co">#&gt; R version 4.5.2 (2025-10-31 ucrt)</span></span>
+<span id="cb20-3"><a href="#cb20-3" tabindex="-1"></a><span class="co">#&gt; Platform: x86_64-w64-mingw32/x64</span></span>
+<span id="cb20-4"><a href="#cb20-4" tabindex="-1"></a><span class="co">#&gt; Running under: Windows 11 x64 (build 26200)</span></span>
+<span id="cb20-5"><a href="#cb20-5" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-6"><a href="#cb20-6" tabindex="-1"></a><span class="co">#&gt; Matrix products: default</span></span>
+<span id="cb20-7"><a href="#cb20-7" tabindex="-1"></a><span class="co">#&gt;   LAPACK version 3.12.1</span></span>
+<span id="cb20-8"><a href="#cb20-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-9"><a href="#cb20-9" tabindex="-1"></a><span class="co">#&gt; locale:</span></span>
+<span id="cb20-10"><a href="#cb20-10" tabindex="-1"></a><span class="co">#&gt; [1] LC_COLLATE=C                          </span></span>
+<span id="cb20-11"><a href="#cb20-11" tabindex="-1"></a><span class="co">#&gt; [2] LC_CTYPE=English_United States.utf8   </span></span>
+<span id="cb20-12"><a href="#cb20-12" tabindex="-1"></a><span class="co">#&gt; [3] LC_MONETARY=English_United States.utf8</span></span>
+<span id="cb20-13"><a href="#cb20-13" tabindex="-1"></a><span class="co">#&gt; [4] LC_NUMERIC=C                          </span></span>
+<span id="cb20-14"><a href="#cb20-14" tabindex="-1"></a><span class="co">#&gt; [5] LC_TIME=English_United States.utf8    </span></span>
+<span id="cb20-15"><a href="#cb20-15" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-16"><a href="#cb20-16" tabindex="-1"></a><span class="co">#&gt; time zone: Europe/Luxembourg</span></span>
+<span id="cb20-17"><a href="#cb20-17" tabindex="-1"></a><span class="co">#&gt; tzcode source: internal</span></span>
+<span id="cb20-18"><a href="#cb20-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-19"><a href="#cb20-19" tabindex="-1"></a><span class="co">#&gt; attached base packages:</span></span>
+<span id="cb20-20"><a href="#cb20-20" tabindex="-1"></a><span class="co">#&gt; [1] stats     graphics  grDevices utils     datasets  methods   base     </span></span>
+<span id="cb20-21"><a href="#cb20-21" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-22"><a href="#cb20-22" tabindex="-1"></a><span class="co">#&gt; other attached packages:</span></span>
+<span id="cb20-23"><a href="#cb20-23" tabindex="-1"></a><span class="co">#&gt; [1] joinspy_0.7.3</span></span>
+<span id="cb20-24"><a href="#cb20-24" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-25"><a href="#cb20-25" tabindex="-1"></a><span class="co">#&gt; loaded via a namespace (and not attached):</span></span>
+<span id="cb20-26"><a href="#cb20-26" tabindex="-1"></a><span class="co">#&gt;  [1] digest_0.6.39   R6_2.6.1        fastmap_1.2.0   xfun_0.55      </span></span>
+<span id="cb20-27"><a href="#cb20-27" tabindex="-1"></a><span class="co">#&gt;  [5] glue_1.8.0      cachem_1.1.0    knitr_1.51      htmltools_0.5.9</span></span>
+<span id="cb20-28"><a href="#cb20-28" tabindex="-1"></a><span class="co">#&gt;  [9] rmarkdown_2.30  lifecycle_1.0.5 cli_3.6.5       vctrs_0.7.0    </span></span>
+<span id="cb20-29"><a href="#cb20-29" tabindex="-1"></a><span class="co">#&gt; [13] sass_0.4.10     jquerylib_0.1.4 compiler_4.5.2  tools_4.5.2    </span></span>
+<span id="cb20-30"><a href="#cb20-30" tabindex="-1"></a><span class="co">#&gt; [17] pillar_1.11.1   evaluate_1.0.5  bslib_0.9.0     yaml_2.3.12    </span></span>
+<span id="cb20-31"><a href="#cb20-31" tabindex="-1"></a><span class="co">#&gt; [21] otel_0.2.0      rlang_1.1.7     jsonlite_2.0.0</span></span></code></pre></div>
+</div>
+
+
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>
