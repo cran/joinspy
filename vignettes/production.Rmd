@@ -1,0 +1,426 @@
+---
+title: "Joins in Production"
+author: "Gilles Colling"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Joins in Production}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 6,
+  fig.height = 4
+)
+library(joinspy)
+```
+
+At the console, we see the wrong row count, fix the key, and re-run. In a
+scheduled script, the same issue goes unnoticed until someone looks at the
+output. This vignette wires joinspy into automated pipelines so that join
+problems surface as errors or log entries. Every example uses synthetic data
+and `tempfile()` paths, so the whole thing runs end to end.
+
+## Assertions with key_check()
+
+`key_check()` returns a single logical -- `TRUE` if no issues were detected,
+`FALSE` otherwise. The simplest assertion wraps it in `stopifnot()`:
+
+```{r}
+orders <- data.frame(
+  customer_id = c("C01", "C02", "C03", "C04"),
+  amount = c(100, 200, 150, 300),
+  stringsAsFactors = FALSE
+)
+
+customers <- data.frame(
+  customer_id = c("C01", "C02", "C03", "C04"),
+  region = c("East", "West", "East", "North"),
+  stringsAsFactors = FALSE
+)
+
+# This passes -- keys are clean
+stopifnot(key_check(orders, customers, by = "customer_id", warn = FALSE))
+```
+
+When the keys have problems, the script halts:
+
+```{r error = TRUE}
+orders_dirty <- data.frame(
+  customer_id = c("C01", "C02 ", "C03 ", "C04"),
+  amount = c(100, 200, 150, 300),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(key_check(orders_dirty, customers, by = "customer_id", warn = FALSE))
+```
+
+With `warn = FALSE`, the printed diagnostics are suppressed -- in a cron job or
+CI pipeline, we want the script to fail hard rather than print warnings. An
+explicit `if`/`stop` gives us a custom error message:
+
+```{r error = TRUE}
+if (!key_check(orders_dirty, customers, by = "customer_id", warn = FALSE)) {
+  stop("Key quality check failed for orders-customers join. ",
+       "Run join_spy() interactively for details.", call. = FALSE)
+}
+```
+
+We can also chain the assertion with a repair step -- run `key_check()` first,
+repair on failure, then re-check:
+
+```{r}
+ok <- key_check(orders_dirty, customers, by = "customer_id", warn = FALSE)
+
+if (!ok) {
+  repaired <- join_repair(
+    orders_dirty, customers,
+    by = "customer_id",
+    trim_whitespace = TRUE,
+    remove_invisible = TRUE
+  )
+  orders_clean <- repaired$x
+  customers_clean <- repaired$y
+
+  # Re-check after repair
+  stopifnot(key_check(orders_clean, customers_clean,
+                       by = "customer_id", warn = FALSE))
+}
+```
+
+`key_check()` is a binary pass/fail gate; `join_spy()` builds a full report
+with match rates, expected row counts, and categorized issues. In production,
+`key_check()` runs on every execution. `join_spy()` is what we reach for when
+an assertion fails and we need to understand why.
+
+## Silent Joins in Pipelines
+
+The `*_join_spy()` wrappers print diagnostic output by default. In a scheduled
+script, `.quiet = TRUE` suppresses all printed output while still computing the
+report internally.
+
+```{r}
+sensors <- data.frame(
+  sensor_id = c("S01", "S02", "S03", "S04"),
+  location = c("Roof", "Basement", "Lobby", "Garage"),
+  stringsAsFactors = FALSE
+)
+
+readings <- data.frame(
+  sensor_id = c("S01", "S02", "S03", "S05"),
+  temperature = c(22.1, 18.5, 21.0, 19.3),
+  stringsAsFactors = FALSE
+)
+
+# Nothing printed
+result <- left_join_spy(sensors, readings, by = "sensor_id", .quiet = TRUE)
+```
+
+The report is still available via `last_report()`:
+
+```{r}
+rpt <- last_report()
+rpt$match_analysis$match_rate
+```
+
+The join runs silently; later, we pull the report and check its contents
+programmatically:
+
+```{r}
+rpt <- last_report()
+if (rpt$match_analysis$match_rate < 0.95) {
+  warning(sprintf(
+    "Low match rate (%.1f%%) in sensor join -- check for missing sensor IDs",
+    rpt$match_analysis$match_rate * 100
+  ))
+}
+```
+
+The report object is a plain list, so standard R subsetting works for
+arbitrarily complex validation logic.
+
+One caveat: `last_report()` stores only the most recent report. If a script
+performs three joins in sequence, only the third report survives. To retain
+earlier reports, capture them explicitly:
+
+```{r}
+result1 <- left_join_spy(sensors, readings, by = "sensor_id", .quiet = TRUE)
+report1 <- last_report()
+
+# ... later ...
+result2 <- inner_join_spy(sensors, readings, by = "sensor_id", .quiet = TRUE)
+report2 <- last_report()
+```
+
+## Cardinality Guards
+
+A join that was one-to-one in development can become many-to-many in production
+when upstream data changes. `join_strict()` enforces a cardinality constraint
+and throws an error if it is violated.
+
+In development, we use `detect_cardinality()` to understand the actual
+relationship:
+
+```{r}
+products <- data.frame(
+  product_id = c("P1", "P2", "P3"),
+  name = c("Widget", "Gadget", "Gizmo"),
+  stringsAsFactors = FALSE
+)
+
+line_items <- data.frame(
+  product_id = c("P1", "P1", "P2", "P3", "P3"),
+  order_id = c(101, 102, 103, 104, 105),
+  stringsAsFactors = FALSE
+)
+
+detect_cardinality(products, line_items, by = "product_id")
+```
+
+One-to-many: each product appears once in `products` but can appear multiple
+times in `line_items`. We encode that expectation in production:
+
+```{r}
+result <- join_strict(
+  products, line_items,
+  by = "product_id",
+  type = "left",
+  expect = "1:m"
+)
+nrow(result)
+```
+
+If someone loads a `products` table with duplicate product IDs, the script
+fails immediately:
+
+```{r error = TRUE}
+products_bad <- data.frame(
+  product_id = c("P1", "P1", "P2", "P3"),
+  name = c("Widget", "Widget v2", "Gadget", "Gizmo"),
+  stringsAsFactors = FALSE
+)
+
+join_strict(
+  products_bad, line_items,
+  by = "product_id",
+  type = "left",
+  expect = "1:m"
+)
+```
+
+The four cardinality levels:
+
+- **1:1** -- lookup to lookup. Each key appears exactly once on both sides.
+- **1:m** -- reference on the left, transactions on the right (products to
+  line items, stations to hourly readings).
+- **m:1** -- transactions on the left, lookup on the right (sales joined to a
+  region table).
+- **m:m** -- duplicates on both sides. Almost always a bug; requiring an
+  explicit `expect = "m:m"` acts as a speed bump.
+
+In practice, `"1:m"` and `"m:1"` cover most production joins.
+`detect_cardinality()` confirms the relationship during development; the
+`expect` value is then hard-coded in the production script.
+
+`check_cartesian()` solves a different problem: it warns about Cartesian
+product explosion when a key has many duplicates on *both* sides. A join can
+violate a `"1:1"` constraint without triggering a Cartesian explosion (one
+extra duplicate is enough), and a `"m:m"` join can produce a massive product
+that `join_strict()` would allow. The two functions complement each other.
+
+## Logging and Audit Trails
+
+### Manual logging
+
+`log_report()` writes a single report to a file. The format depends on the
+file extension:
+
+```{r}
+report <- join_spy(sensors, readings, by = "sensor_id")
+
+# Text format -- human-readable
+txt_log <- tempfile(fileext = ".log")
+log_report(report, txt_log)
+cat(readLines(txt_log), sep = "\n")
+unlink(txt_log)
+```
+
+```{r}
+# JSON format -- machine-readable
+json_log <- tempfile(fileext = ".json")
+log_report(report, json_log)
+cat(readLines(json_log), sep = "\n")
+unlink(json_log)
+```
+
+Text format works for tailing logs during a batch run; JSON format feeds into
+monitoring systems or downstream scripts. Reports can also be saved as `.rds`
+files, which preserves the full R object for later interactive inspection.
+
+### Automatic logging
+
+For scripts with many joins, `set_log_file()` at the top is cleaner than
+calling `log_report()` after each one. Every subsequent `*_join_spy()` call
+appends its report to the file.
+
+```{r}
+auto_log <- tempfile(fileext = ".log")
+set_log_file(auto_log, format = "text")
+
+# These joins are automatically logged
+result1 <- left_join_spy(sensors, readings, by = "sensor_id", .quiet = TRUE)
+result2 <- inner_join_spy(sensors, readings, by = "sensor_id", .quiet = TRUE)
+
+# Check what got logged
+cat(readLines(auto_log), sep = "\n")
+
+# Clean up
+set_log_file(NULL)
+unlink(auto_log)
+```
+
+Automatic logging only triggers from `*_join_spy()` wrappers. `join_strict()`
+and bare `merge()` calls are not logged -- the wrappers are the instrumented
+path. To combine cardinality enforcement with logging, run
+`detect_cardinality()` as a separate check and use a `*_join_spy()` wrapper for
+the actual join.
+
+`get_log_file()` returns the current log path (or `NULL` if logging is
+disabled):
+
+```{r}
+# Only log if logging is configured
+if (!is.null(get_log_file())) {
+  message("Logging is active at: ", get_log_file())
+}
+```
+
+## Sampling for Large Datasets
+
+The `sample` parameter in `join_spy()` runs the analysis on a random subset
+while the actual join (via a `*_join_spy()` wrapper) still operates on the full
+data.
+
+```{r}
+# Simulate a large dataset
+set.seed(42)
+big_orders <- data.frame(
+  customer_id = sample(paste0("C", sprintf("%04d", 1:5000)), 50000, replace = TRUE),
+  amount = round(runif(50000, 10, 500), 2),
+  stringsAsFactors = FALSE
+)
+
+big_customers <- data.frame(
+  customer_id = paste0("C", sprintf("%04d", 1:6000)),
+  region = sample(c("North", "South", "East", "West"), 6000, replace = TRUE),
+  stringsAsFactors = FALSE
+)
+
+# Full analysis
+system.time(report_full <- join_spy(big_orders, big_customers, by = "customer_id"))
+
+# Sampled analysis
+system.time(report_sampled <- join_spy(big_orders, big_customers,
+                                        by = "customer_id", sample = 5000))
+```
+
+The sampled report is approximate -- match rates and duplicate counts are
+estimated from the subset. For production monitoring, we typically care whether
+the match rate is roughly 95% or roughly 60%, not whether it is 94.7% or
+95.1%. Sampling catches systemic problems (wrong key column, widespread
+encoding issues, duplicate explosion) with a fraction of the runtime.
+
+Sampling can miss rare issues. If 0.1% of keys have a zero-width space, a
+5,000-row sample from a 10-million-row table might not include any. Running
+full diagnostics periodically (weekly, or when the upstream source changes)
+alongside sampled daily runs covers both speed and thoroughness.
+
+## A Complete Production Pattern
+
+Here is a realistic production workflow: a nightly job loads order and customer
+data, validates keys, repairs if needed, joins with cardinality enforcement, and
+logs everything.
+
+```{r}
+# ============================================================
+# Nightly order enrichment pipeline
+# ============================================================
+
+# --- Setup logging ---
+pipeline_log <- tempfile(fileext = ".log")
+set_log_file(pipeline_log, format = "text")
+
+# --- Load data (simulated) ---
+orders <- data.frame(
+  order_id = 1:6,
+  customer_id = c("C001", "C002 ", "C003", "C003", "C004", "C005"),
+  amount = c(150, 230, 89, 410, 320, 175),
+  stringsAsFactors = FALSE
+)
+
+customers <- data.frame(
+  customer_id = c("C001", "C002", "C003", "C004", "C005", "C006"),
+  name = c("Acme Corp", "Globex", "Initech", "Umbrella", "Soylent", "Wonka"),
+  tier = c("gold", "silver", "gold", "bronze", "silver", "gold"),
+  stringsAsFactors = FALSE
+)
+
+# --- Gate 1: key quality assertion ---
+keys_ok <- key_check(orders, customers, by = "customer_id", warn = FALSE)
+
+if (!keys_ok) {
+  message("Key issues detected -- attempting repair")
+  repaired <- join_repair(
+    orders, customers,
+    by = "customer_id",
+    trim_whitespace = TRUE,
+    remove_invisible = TRUE
+  )
+  orders <- repaired$x
+  customers <- repaired$y
+}
+
+# --- Gate 2: cardinality check ---
+card <- detect_cardinality(orders, customers, by = "customer_id")
+if (card == "m:m") {
+  set_log_file(NULL)
+  unlink(pipeline_log)
+  stop("Unexpected m:m cardinality in orders-customers join", call. = FALSE)
+}
+
+# --- Join (with auto-logging via *_join_spy) ---
+enriched <- left_join_spy(orders, customers, by = "customer_id", .quiet = TRUE)
+
+# --- Gate 3: row count sanity check ---
+# A left join should never lose rows from the left table
+if (nrow(enriched) < nrow(orders)) {
+  set_log_file(NULL)
+  unlink(pipeline_log)
+  stop("Row count decreased after left join -- possible data corruption",
+       call. = FALSE)
+}
+
+# --- Output ---
+message(sprintf("Pipeline complete: %d enriched orders", nrow(enriched)))
+head(enriched)
+
+# --- Review the log ---
+if (file.exists(pipeline_log)) {
+  cat(readLines(pipeline_log), sep = "\n")
+}
+
+# --- Cleanup ---
+set_log_file(NULL)
+unlink(pipeline_log)
+```
+
+The three gates catch different failure modes: `key_check()` catches
+string-level problems and attempts repair, `detect_cardinality()` halts on
+unexpected many-to-many relationships, and the row count check guards against
+anything the first two gates missed. Logging runs throughout because
+`set_log_file()` was called at the top. The structure scales -- more tables,
+more gates, more joins, same pattern.

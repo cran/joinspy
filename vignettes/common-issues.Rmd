@@ -1,10 +1,10 @@
 ---
-title: "Common Join Issues and Solutions"
+title: "Common Join Problems"
 author: "Gilles Colling"
 date: "`r Sys.Date()`"
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{Common Join Issues and Solutions}
+  %\VignetteIndexEntry{Common Join Problems}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---
@@ -19,40 +19,19 @@ knitr::opts_chunk$set(
 library(joinspy)
 ```
 
-## Overview
+Most join bugs are not about cardinality. They are about strings. A trailing
+space, a flipped case, a zero-width Unicode character: any of these will cause
+two keys that *look* identical to fail matching without a warning from R.
 
-This vignette catalogs common join problems and shows how joinspy detects and resolves them. Each issue includes detection methods and recommended solutions.
+We will walk through the problems joinspy catches, ordered roughly by
+frequency. String-level issues come first, then structural issues (duplicates,
+NAs, type mismatches, Cartesian explosions).
 
-## Issue 1: Duplicate Keys
+## Trailing and leading whitespace
 
-**Problem**: When one or both tables have duplicate keys, joins multiply rows unexpectedly.
-
-```{r}
-orders <- data.frame(
-  customer_id = c(1, 2, 2, 3),
-  amount = c(100, 50, 75, 200)
-)
-
-addresses <- data.frame(
-  customer_id = c(1, 2, 2, 3),
-  address = c("NYC", "LA", "SF", "Chicago")
-)
-
-join_spy(orders, addresses, by = "customer_id")
-```
-
-**Detection**: `join_spy()` reports duplicate counts and expected row multiplication.
-
-**Solution**: Aggregate or filter duplicates before joining.
-
-```{r}
-key_duplicates(orders, by = "customer_id")
-key_duplicates(addresses, by = "customer_id")
-```
-
-## Issue 2: Whitespace
-
-**Problem**: Invisible leading/trailing spaces prevent matches.
+The classic. Someone exports a CSV from Excel, and now half the keys carry a
+trailing space. Everything looks fine when we print the data frame. Nothing
+matches when we join.
 
 ```{r}
 sales <- data.frame(
@@ -70,47 +49,265 @@ inventory <- data.frame(
 join_spy(sales, inventory, by = "product")
 ```
 
-**Detection**: `join_spy()` flags whitespace issues in the Issues section.
-
-**Solution**: Use `join_repair()` or `trimws()`.
+Two of three keys carry whitespace that prevents matching. `join_repair()`
+strips it:
 
 ```{r}
-sales_fixed <- join_repair(sales, by = "product")
-key_check(sales_fixed, inventory, by = "product")
+sales_clean <- join_repair(sales, by = "product")
+key_check(sales_clean, inventory, by = "product")
 ```
 
-## Issue 3: Case Mismatches
+Passing `dry_run = TRUE` previews the repair without applying it.
 
-**Problem**: Keys differ only by case ("ABC" vs "abc").
+The problem compounds with composite keys -- whitespace in *any* column is
+enough to break the match:
 
 ```{r}
+shipments <- data.frame(
+  warehouse = c("East ", "West", "East "),
+  product   = c("Widget", "Gadget ", "Gizmo"),
+  shipped   = c(50, 80, 35),
+  stringsAsFactors = FALSE
+)
+
+stock <- data.frame(
+  warehouse = c("East", "West", "East"),
+  product   = c("Widget", "Gadget", "Gizmo"),
+  on_hand   = c(200, 150, 90),
+  stringsAsFactors = FALSE
+)
+
+join_spy(shipments, stock, by = c("warehouse", "product"))
+```
+
+Both `warehouse` and `product` carry trailing spaces in `shipments`, so all
+three rows fail to match. A single `join_repair()` call cleans every key
+column at once:
+
+```{r}
+shipments_clean <- join_repair(shipments, by = c("warehouse", "product"))
+key_check(shipments_clean, stock, by = c("warehouse", "product"))
+```
+
+## Case mismatches
+
+Databases are often case-insensitive; R is not. When we pull tables from two
+different systems, one might store `"ABC"` and the other `"abc"`.
+
+```{r}
+sensors <- data.frame(
+  station = c("AWS-01", "aws-02", "Aws-03"),
+  temp = c(22.1, 18.4, 25.7),
+  stringsAsFactors = FALSE
+)
+
+metadata <- data.frame(
+  station = c("aws-01", "AWS-02", "AWS-03"),
+  region = c("North", "South", "East"),
+  stringsAsFactors = FALSE
+)
+```
+
+None of these keys match as-is:
+
+```{r}
+join_spy(sensors, metadata, by = "station")
+```
+
+We can repair both sides to a common case:
+
+```{r}
+repaired <- join_repair(sensors, metadata, by = "station", standardize_case = "lower")
+key_check(repaired$x, repaired$y, by = "station")
+```
+
+`"lower"`, `"upper"`, and `"title"` all work. One thing to watch for: if the
+key column is a `factor`, case standardization changes the level labels but not
+the underlying integer codes. Converting to character first avoids silently
+merging distinct factor levels.
+
+## Encoding and invisible characters
+
+A key contains a non-breaking space (U+00A0) instead of a regular space, or
+a zero-width joiner crept in during a copy-paste from a PDF. The strings
+print identically but do not match.
+
+```{r}
+# Simulate a non-breaking space in one key
 left <- data.frame(
-  code = c("ABC", "def", "GHI"),
-  value = 1:3,
+  city = c("New York", "Los\u00a0Angeles", "Chicago"),
+  pop = c(8.3, 3.9, 2.7),
   stringsAsFactors = FALSE
 )
 
 right <- data.frame(
-  code = c("abc", "DEF", "ghi"),
-  label = c("A", "D", "G"),
+  city = c("New York", "Los Angeles", "Chicago"),
+  area = c(302, 469, 227),
   stringsAsFactors = FALSE
 )
 
-join_spy(left, right, by = "code")
+join_spy(left, right, by = "city")
 ```
 
-**Detection**: `join_spy()` detects case mismatches when keys would match if case-insensitive.
-
-**Solution**: Standardize case with `join_repair()`.
+The `"Los\u00a0Angeles"` key in `left` looks like `"Los Angeles"` in `right`,
+but the non-breaking space makes them different byte sequences.
+`join_repair()` with `remove_invisible = TRUE` (the default) strips these out:
 
 ```{r}
-repaired <- join_repair(left, right, by = "code", standardize_case = "upper")
-key_check(repaired$x, repaired$y, by = "code")
+left_fixed <- join_repair(left, by = "city")
+key_check(left_fixed, right, by = "city")
 ```
 
-## Issue 4: NA Keys
+Common sources include PDF extraction, web scraping, and cross-platform file
+transfers. `join_repair()` handles the most common offenders: non-breaking
+spaces, zero-width joiners, BOM markers, and soft hyphens. It does not attempt
+full Unicode normalization (NFC vs. NFD); for that we would reach for
+`stringi::stri_trans_nfc()`.
 
-**Problem**: NA values in key columns never match (by design in R).
+If `join_spy()` still flags encoding issues after repair, `suggest_repairs()`
+on a report will print the exact R code needed.
+
+## Empty strings masquerading as data
+
+Empty strings (`""`) are valid character values in R. They will match other
+empty strings in a join, which is almost never what we want: two rows with
+missing identifiers get joined as though they refer to the same entity.
+
+```{r}
+patients <- data.frame(
+  mrn = c("P001", "", "P003"),
+  age = c(34, 56, 29),
+  stringsAsFactors = FALSE
+)
+
+visits <- data.frame(
+  mrn = c("P001", "P002", ""),
+  date = c("2024-01-10", "2024-02-15", "2024-03-20"),
+  stringsAsFactors = FALSE
+)
+
+join_spy(patients, visits, by = "mrn")
+```
+
+Converting empties to `NA` before joining fixes this, since NAs never match
+in R:
+
+```{r}
+patients_fixed <- join_repair(patients, by = "mrn", empty_to_na = TRUE)
+patients_fixed$mrn
+```
+
+Note that `data.table` treats `""` and `NA_character_` as distinct in keyed
+joins, so when using a data.table backend we need to convert empty strings to
+`NA` on both sides.
+
+## Near-matches and typos
+
+Sometimes keys are close but not identical. These are not whitespace or case
+problems -- they are genuine mismatches that `join_spy()` flags when it finds
+keys in one table with no counterpart in the other.
+
+```{r}
+orders <- data.frame(
+  sku = c("WDG-100", "GDG-200", "GZM-300"),
+  qty = c(5, 12, 8),
+  stringsAsFactors = FALSE
+)
+
+catalog <- data.frame(
+  sku = c("WDG-100", "GDG-200", "GZM-301"),
+  price = c(9.99, 14.99, 7.50),
+  stringsAsFactors = FALSE
+)
+
+report <- join_spy(orders, catalog, by = "sku")
+```
+
+Internally, `join_spy()` computes Levenshtein distances between unmatched keys.
+When two keys differ by only one or two characters, the report flags them as
+near-matches. Here is a clearer example with multiple near-matches:
+
+```{r}
+employees <- data.frame(
+  name = c("Johnson", "Smithe", "O'Brian", "Williams"),
+  dept = c("Sales", "R&D", "Ops", "HR"),
+  stringsAsFactors = FALSE
+)
+
+payroll <- data.frame(
+  name = c("Jonhson", "Smith", "O'Brien", "Williams"),
+  salary = c(55000, 62000, 48000, 71000),
+  stringsAsFactors = FALSE
+)
+
+report <- join_spy(employees, payroll, by = "name")
+```
+
+`"Johnson"` vs. `"Jonhson"` (transposition), `"Smithe"` vs. `"Smith"` (extra
+character), and `"O'Brian"` vs. `"O'Brien"` (vowel swap) are all within edit
+distance 2. `"Williams"` matches exactly. There is no automated fix here since
+joinspy cannot know which side is correct, but the near-match list gives a
+concrete starting point for building a lookup table.
+
+## Duplicate keys
+
+Duplicate keys cause row multiplication. A left join on a key that appears
+twice in the right table doubles the corresponding rows from the left.
+
+```{r}
+orders <- data.frame(
+  customer_id = c(1, 2, 3),
+  amount = c(100, 250, 75)
+)
+
+addresses <- data.frame(
+  customer_id = c(1, 2, 2, 3),
+  address = c("NYC", "LA", "SF", "Chicago"),
+  stringsAsFactors = FALSE
+)
+
+join_spy(orders, addresses, by = "customer_id")
+```
+
+`key_duplicates()` shows which rows are responsible:
+
+```{r}
+key_duplicates(addresses, by = "customer_id")
+```
+
+If each customer should have one address, we deduplicate first. If we
+genuinely need all combinations, the multiplication is correct -- we just
+need to know it will happen.
+
+When *both* sides have duplicates, each key group produces a Cartesian
+product:
+
+```{r}
+orders_dup <- data.frame(
+  product = c("A", "A", "B", "B"),
+  qty     = c(10, 20, 5, 15)
+)
+
+prices_dup <- data.frame(
+  product = c("A", "A", "A", "B", "B"),
+  price   = c(1.0, 1.1, 1.2, 2.0, 2.5)
+)
+
+join_spy(orders_dup, prices_dup, by = "product")
+```
+
+Product `"A"` has 2 rows on the left and 3 on the right, so a join produces
+2 x 3 = 6 rows for that key alone. `check_cartesian()` quantifies the total
+expansion before we run the join:
+
+```{r}
+check_cartesian(orders_dup, prices_dup, by = "product")
+```
+
+## NA keys
+
+`NA` never equals `NA` in R. This is by design, but it surprises people who
+expect two missing values to match.
 
 ```{r}
 orders <- data.frame(
@@ -120,92 +317,32 @@ orders <- data.frame(
 
 customers <- data.frame(
   customer_id = c(1, 2, 3, NA),
-  name = c("Alice", "Bob", "Carol", "Unknown")
+  name = c("Alice", "Bob", "Carol", "Unknown"),
+  stringsAsFactors = FALSE
 )
 
 join_spy(orders, customers, by = "customer_id")
 ```
 
-**Detection**: `join_spy()` reports NA counts in the Table Summary.
-
-**Solution**: Handle NA values explicitly—remove them or replace with a placeholder.
+We can either remove rows with NA keys before joining, or replace NAs with a
+sentinel value if we actually want them to match:
 
 ```{r}
-# Option 1: Remove rows with NA keys
+# Remove
 orders_clean <- orders[!is.na(orders$customer_id), ]
-
-# Option 2: Replace NA with placeholder
-orders$customer_id[is.na(orders$customer_id)] <- -999
+key_check(orders_clean, customers, by = "customer_id")
 ```
 
-## Issue 5: No Matches
+## Type mismatches
 
-**Problem**: Inner join returns zero rows when you expected matches.
+One table stores IDs as integers, the other as character strings.
+`merge()` coerces silently; `dplyr::left_join()` refuses. Either way,
+we want to know about it before the join.
 
 ```{r}
-system_a <- data.frame(
-  user_id = c("USR001", "USR002", "USR003"),
-  score = c(85, 90, 78),
-  stringsAsFactors = FALSE
-)
-
-system_b <- data.frame(
-  user_id = c("1", "2", "3"),
-  department = c("Sales", "Marketing", "Engineering"),
-  stringsAsFactors = FALSE
-)
-
-report <- join_spy(system_a, system_b, by = "user_id")
-```
-
-**Detection**: Match analysis shows 0% match rate.
-
-**Solution**: Create a mapping table or transform keys to a common format.
-
-```{r}
-# Extract numeric part
-system_a$user_num <- gsub("USR0*", "", system_a$user_id)
-key_check(system_a, system_b, by = c("user_num" = "user_id"))
-```
-
-## Issue 6: Many-to-Many Explosion
-
-**Problem**: Both tables have duplicate keys, causing exponential row growth.
-
-```{r}
-order_items <- data.frame(
-  order_id = c(1, 1, 2, 2, 2),
-  item = c("A", "B", "C", "D", "E")
-)
-
-order_payments <- data.frame(
-  order_id = c(1, 1, 2, 2),
-  payment = c("CC1", "CC2", "Cash", "Check")
-)
-
-report <- join_spy(order_items, order_payments, by = "order_id")
-```
-
-**Detection**: Expected row counts show multiplication (inner join = 10 rows from 9 source rows).
-
-**Solution**: Aggregate one table first, or use `check_cartesian()`.
-
-```{r}
-check_cartesian(order_items, order_payments, by = "order_id")
-```
-
-```{r error = TRUE}
-# Enforce cardinality to catch this
-join_strict(order_items, order_payments, by = "order_id", expect = "1:m")
-```
-
-## Issue 7: Type Mismatches
-
-**Problem**: Keys have different types (numeric vs character).
-```{r}
-orders <- data.frame(
+invoices <- data.frame(
   product_id = c(1, 2, 3),
-  quantity = c(10, 20, 30)
+  total = c(500, 300, 150)
 )
 
 products <- data.frame(
@@ -214,99 +351,142 @@ products <- data.frame(
   stringsAsFactors = FALSE
 )
 
-join_spy(orders, products, by = "product_id")
+join_spy(invoices, products, by = "product_id")
 ```
 
-**Detection**: `join_spy()` flags type coercion warnings.
-
-**Solution**: Convert to matching types before joining.
+A subtler variant occurs with `Date` vs. character, or `POSIXct` vs. `Date`,
+where the join either fails or coerces through numeric intermediaries.
+`join_spy()` flags the type mismatch regardless of the types involved.
 
 ```{r}
-orders$product_id <- as.character(orders$product_id)
-key_check(orders, products, by = "product_id")
+invoices$product_id <- as.character(invoices$product_id)
+key_check(invoices, products, by = "product_id")
 ```
 
-## Issue 8: Empty Strings vs NA
+## Many-to-many explosions
 
-**Problem**: Empty strings (`""`) and `NA` behave differently in joins.
+When both tables have duplicate keys, we get a Cartesian product within each
+key group. With real data this can turn a 10,000-row join into a million-row
+table.
 
 ```{r}
-left <- data.frame(
-  id = c("A", "", "C"),
-  value = 1:3,
+items <- data.frame(
+  order_id = c(1, 1, 2, 2, 2),
+  item = c("A", "B", "C", "D", "E"),
   stringsAsFactors = FALSE
 )
 
-right <- data.frame(
-  id = c("A", "B", ""),
-  label = c("Alpha", "Beta", "Empty"),
+payments <- data.frame(
+  order_id = c(1, 1, 2, 2),
+  method = c("Card", "Cash", "Card", "Wire"),
   stringsAsFactors = FALSE
 )
 
-join_spy(left, right, by = "id")
+check_cartesian(items, payments, by = "order_id")
 ```
 
-**Detection**: `join_spy()` warns about empty strings in keys.
-
-**Solution**: Convert empty strings to NA with `join_repair()`.
+`detect_cardinality()` tells us the relationship type:
 
 ```{r}
-left_fixed <- join_repair(left, by = "id", empty_to_na = TRUE)
-left_fixed$id
+detect_cardinality(items, payments, by = "order_id")
 ```
 
-## Using join_strict() for Safety
-
-When you know the expected cardinality, use `join_strict()` to fail fast:
+If we expected a one-to-many relationship, `join_strict()` will stop us
+before the explosion happens:
 
 ```{r error = TRUE}
-products <- data.frame(id = 1:3, name = c("A", "B", "C"))
-prices <- data.frame(id = c(1, 2, 2, 3), price = c(10, 20, 25, 30))
-
-join_strict(products, prices, by = "id", expect = "1:1")
+join_strict(items, payments, by = "order_id", type = "left", expect = "1:m")
 ```
 
-## Automatic Detection with detect_cardinality()
+## No matches at all
 
-Let joinspy determine the actual relationship:
+An inner join returns zero rows, and downstream code may not check for an
+empty data frame.
 
 ```{r}
-orders <- data.frame(id = c(1, 1, 2, 3), item = c("A", "B", "C", "D"))
-customers <- data.frame(id = 1:3, name = c("Alice", "Bob", "Carol"))
+system_a <- data.frame(
+  user_id = c("USR-001", "USR-002", "USR-003"),
+  score = c(85, 90, 78),
+  stringsAsFactors = FALSE
+)
 
-detect_cardinality(orders, customers, by = "id")
+system_b <- data.frame(
+  user_id = c("1", "2", "3"),
+  dept = c("Sales", "R&D", "Ops"),
+  stringsAsFactors = FALSE
+)
+
+join_spy(system_a, system_b, by = "user_id")
 ```
 
-## Quick Reference
+Zero overlap -- the keys use completely different formats, and no amount of
+trimming or case-folding will help. We need a mapping table or a
+transformation that extracts the numeric part:
 
-| Issue | Detection | Solution |
-|-------|-----------|----------|
-| Duplicates | `join_spy()`, `key_duplicates()` | Aggregate or filter |
-| Whitespace | `join_spy()`, `key_check()` | `join_repair()`, `trimws()` |
-| Case mismatch | `join_spy()` | `join_repair(standardize_case=)` |
-| NA keys | `join_spy()` Table Summary | Remove or replace |
-| No matches | `join_spy()` Match Analysis | Check key format/mapping |
-| M:M explosion | `join_spy()`, `check_cartesian()` | Aggregate first |
-| Type mismatch | `join_spy()` | Convert types |
-| Empty strings | `join_spy()` | `join_repair(empty_to_na=TRUE)` |
+```{r}
+system_a$user_num <- gsub("^USR-0*", "", system_a$user_id)
+key_check(system_a, system_b, by = c("user_num" = "user_id"))
+```
 
-## Troubleshooting Workflow
+## Troubleshooting workflow
 
-1. Run `join_spy(x, y, by)` to get a comprehensive diagnostic
-2. Check the Issues section for detected problems
-3. Use `key_duplicates()` to locate specific duplicate rows
-4. Apply `join_repair()` to fix whitespace/case/encoding issues
-5. Use `join_strict()` to enforce expected cardinality
-6. After joining, use `join_explain()` to understand row count changes
+When a join goes wrong, we typically start with `join_spy()`. It checks
+string quality, key overlap, cardinality, and predicted row counts in one
+call:
+
+```{r eval = FALSE}
+report <- join_spy(x, y, by = "key_col")
+```
+
+For large datasets, passing `sample = 1000` runs the check on a random subset
+first.
+
+If the report flags whitespace, case, encoding, or empty strings,
+`join_repair()` handles them:
+
+```{r eval = FALSE}
+x_clean <- join_repair(x, by = "key_col")
+# or both sides:
+repaired <- join_repair(x, y, by = "key_col", standardize_case = "lower")
+```
+
+If the predicted row count is higher than expected, we inspect duplicates and
+decide whether to aggregate or deduplicate:
+
+```{r eval = FALSE}
+key_duplicates(y, by = "key_col")
+```
+
+Once keys are clean, `join_strict()` enforces the cardinality we expect:
+
+```{r eval = FALSE}
+result <- join_strict(x_clean, y_clean, by = "key_col",
+                      type = "left", expect = "1:1")
+```
+
+If the joined output still looks wrong, `join_explain()` gives a breakdown of
+what happened:
+
+```{r eval = FALSE}
+result <- left_join_spy(x_clean, y_clean, by = "key_col")
+join_explain(result, x_clean, y_clean, by = "key_col")
+```
+
+In production pipelines, `set_log_file()` routes all subsequent reports to a
+log file, which is useful for debugging issues after the fact:
+
+```{r eval = FALSE}
+set_log_file("logs/join_diagnostics.log")
+# All join_spy() / join_explain() calls now append to this file
+```
+
+For pipelines with multiple joins, `analyze_join_chain()` diagnoses an entire
+sequence at once, reporting where the first problem enters the chain.
 
 ## See Also
 
-- `vignette("introduction")` - Getting started guide
-- `?join_spy`, `?key_check`, `?join_repair`, `?join_strict`
-- `?check_cartesian`, `?detect_cardinality`
+- `vignette("quickstart")` for a quick introduction to joinspy
 
-## Session Info
+- `?join_spy`, `?join_repair`, `?key_check`, `?join_strict`
 
-```{r}
-sessionInfo()
-```
+- `?check_cartesian`, `?detect_cardinality`, `?join_explain`
