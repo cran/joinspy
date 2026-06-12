@@ -12,7 +12,7 @@
 
 <meta name="author" content="Gilles Colling" />
 
-<meta name="date" content="2026-03-31" />
+<meta name="date" content="2026-06-12" />
 
 <title>Quick Start</title>
 
@@ -341,20 +341,25 @@ code > span.er { color: #a61717; background-color: #e3d2d2; }
 
 <h1 class="title toc-ignore">Quick Start</h1>
 <h4 class="author">Gilles Colling</h4>
-<h4 class="date">2026-03-31</h4>
+<h4 class="date">2026-06-12</h4>
 
 
 
-<p>joinspy diagnoses join keys before you join. It surfaces the
-string-level problems that kill match rates (whitespace, case, encoding,
-typos) and offers one-call repair. Works with base R, dplyr, and
+<p>joinspy diagnoses join keys and performs joins with cardinality
+enforcement. It surfaces the string-level problems that prevent keys
+from matching (whitespace, case, encoding, typos) and offers one-call
+repair. <code>join_strict()</code> lets you declare the expected
+cardinality (<code>1:1</code>, <code>1:n</code>, <code>n:1</code>,
+<code>n:m</code>) and errors if the data violates it — the output row
+count is predictable by construction. Works with base R, dplyr, and
 data.table.</p>
 <div id="string-diagnostics" class="section level2">
 <h2>String Diagnostics</h2>
-<p>Most failed joins are not caused by missing data. They fail because
-the keys <em>look</em> identical but differ at the byte level: a
-trailing space, a case mismatch, an invisible Unicode character.
-<code>str()</code> and <code>summary()</code> won’t reveal these.</p>
+<p>The keys <em>look</em> identical but differ at the byte level: a
+trailing space, a case mismatch, an invisible Unicode character. These
+differences don’t show up in <code>str()</code> or
+<code>summary()</code> output, but they determine whether a join
+matches.</p>
 <div id="whitespace" class="section level3">
 <h3>Whitespace</h3>
 <p>Trailing and leading whitespace is the most common reason keys fail
@@ -566,12 +571,12 @@ ready-to-run code that fixes the detected issues:</p>
 <span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a><span class="fu">suggest_repairs</span>(report)</span>
 <span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a><span class="co">#&gt; </span></span>
 <span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a><span class="co">#&gt; ── Suggested Repairs ───────────────────────────────────────────────────────────</span></span>
-<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a><span class="co">#&gt; x$id &lt;- trimws(x$id)</span></span>
+<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a><span class="co">#&gt; x[[&quot;id&quot;]] &lt;- trimws(x[[&quot;id&quot;]])</span></span>
 <span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a><span class="co">#&gt; # Remove invisible characters:</span></span>
-<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a><span class="co">#&gt; x$id &lt;- gsub(&quot;[\u200B\u200C\u200D\uFEFF\u00A0]&quot;, &quot;&quot;, x$id, perl = TRUE)</span></span>
+<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a><span class="co">#&gt; x[[&quot;id&quot;]] &lt;- gsub(&quot;[\u200B\u200C\u200D\uFEFF\u00A0]&quot;, &quot;&quot;, x[[&quot;id&quot;]], perl = TRUE)</span></span>
 <span id="cb11-8"><a href="#cb11-8" tabindex="-1"></a><span class="co">#&gt; # Standardize case:</span></span>
-<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a><span class="co">#&gt; x$id &lt;- tolower(x$id)</span></span>
-<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a><span class="co">#&gt; y$id &lt;- tolower(y$id)</span></span></code></pre></div>
+<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a><span class="co">#&gt; x[[&quot;id&quot;]] &lt;- tolower(x[[&quot;id&quot;]])</span></span>
+<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a><span class="co">#&gt; y[[&quot;id&quot;]] &lt;- tolower(y[[&quot;id&quot;]])</span></span></code></pre></div>
 <p>The generated code calls <code>join_repair()</code> with the
 appropriate flags based on what the report detected.</p>
 </div>
@@ -832,9 +837,12 @@ session.</p>
 </div>
 <div id="cardinality-enforcement" class="section level2">
 <h2>Cardinality Enforcement</h2>
-<p><code>join_strict()</code> performs a join that errors if the key
-relationship violates a stated expectation. This is a guard against
-unexpected many-to-many joins that multiply rows.</p>
+<p>Every join has an intended cardinality: a lookup table is
+<code>1:n</code>, a one-to-one mapping is <code>1:1</code>.
+<code>join_strict()</code> lets you declare that relationship. If the
+data violates it, the join errors instead of producing a wrong-sized
+result. The output row count is determined by the constraint you
+specify.</p>
 <div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a>sensors <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
 <span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a>  <span class="at">sensor_id =</span> <span class="fu">c</span>(<span class="st">&quot;T1&quot;</span>, <span class="st">&quot;T2&quot;</span>, <span class="st">&quot;T3&quot;</span>),</span>
 <span id="cb19-3"><a href="#cb19-3" tabindex="-1"></a>  <span class="at">location =</span> <span class="fu">c</span>(<span class="st">&quot;Roof&quot;</span>, <span class="st">&quot;Basement&quot;</span>, <span class="st">&quot;Lobby&quot;</span>),</span>
@@ -861,26 +869,26 @@ unexpected many-to-many joins that multiply rows.</p>
 <span id="cb20-6"><a href="#cb20-6" tabindex="-1"></a>)</span>
 <span id="cb20-7"><a href="#cb20-7" tabindex="-1"></a></span>
 <span id="cb20-8"><a href="#cb20-8" tabindex="-1"></a><span class="fu">join_strict</span>(sensors, readings_dup, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:1&quot;</span>)</span>
-<span id="cb20-9"><a href="#cb20-9" tabindex="-1"></a><span class="co">#&gt; Error:</span></span>
-<span id="cb20-10"><a href="#cb20-10" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected 1:1 but found 1:m</span></span>
-<span id="cb20-11"><a href="#cb20-11" tabindex="-1"></a><span class="co">#&gt;   Left duplicates: 0, Right duplicates: 1</span></span></code></pre></div>
+<span id="cb20-9"><a href="#cb20-9" tabindex="-1"></a><span class="co">#&gt; Error in `join_strict()`:</span></span>
+<span id="cb20-10"><a href="#cb20-10" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected &quot;1:1&quot; but found &quot;1:n&quot;.</span></span>
+<span id="cb20-11"><a href="#cb20-11" tabindex="-1"></a><span class="co">#&gt; ℹ Left duplicates: 0, right duplicates: 1.</span></span></code></pre></div>
 <p>The <code>expect</code> argument accepts four cardinality levels:</p>
 <ul>
-<li><code>&quot;1:1&quot;</code>: both sides have unique keys. Any duplicate on
-either side is an error.</li>
-<li><code>&quot;1:m&quot;</code>: the left table has unique keys, the right may
-repeat. The classic lookup-table join.</li>
-<li><code>&quot;m:1&quot;</code>: the mirror of <code>&quot;1:m&quot;</code>. The right
-table is the lookup.</li>
-<li><code>&quot;m:m&quot;</code>: duplicates allowed on both sides. Rarely what we
-want; exists as an explicit opt-in for intentional Cartesian products
-per key.</li>
+<li><p><code>&quot;1:1&quot;</code>: both sides have unique keys. Any duplicate on
+either side is an error.</p></li>
+<li><p><code>&quot;1:n&quot;</code>: the left table has unique keys, the right may
+repeat. The classic lookup-table join.</p></li>
+<li><p><code>&quot;n:1&quot;</code>: the mirror of <code>&quot;1:n&quot;</code>. The right
+table is the lookup.</p></li>
+<li><p><code>&quot;n:m&quot;</code>: duplicates allowed on both sides. Rarely what
+we want; exists as an explicit opt-in for intentional Cartesian products
+per key.</p></li>
 </ul>
 <p>To detect the actual cardinality without enforcing anything:</p>
 <div class="sourceCode" id="cb21"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" tabindex="-1"></a><span class="fu">detect_cardinality</span>(sensors, readings_dup, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>)</span>
-<span id="cb21-2"><a href="#cb21-2" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;1:m&quot;</span></span>
+<span id="cb21-2"><a href="#cb21-2" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;1:n&quot;</span></span>
 <span id="cb21-3"><a href="#cb21-3" tabindex="-1"></a><span class="co">#&gt; Right duplicates: 1 key(s)</span></span></code></pre></div>
-<p>This returns a string like <code>&quot;1:m&quot;</code> that we can use
+<p>This returns a string like <code>&quot;1:n&quot;</code> that we can use
 programmatically, e.g. to select the right <code>expect</code> value or
 to log the cardinality for monitoring.</p>
 </div>

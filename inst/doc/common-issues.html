@@ -12,7 +12,7 @@
 
 <meta name="author" content="Gilles Colling" />
 
-<meta name="date" content="2026-03-31" />
+<meta name="date" content="2026-06-12" />
 
 <title>Common Join Problems</title>
 
@@ -341,16 +341,15 @@ code > span.er { color: #a61717; background-color: #e3d2d2; }
 
 <h1 class="title toc-ignore">Common Join Problems</h1>
 <h4 class="author">Gilles Colling</h4>
-<h4 class="date">2026-03-31</h4>
+<h4 class="date">2026-06-12</h4>
 
 
 
-<p>Most join bugs are not about cardinality. They are about strings. A
-trailing space, a flipped case, a zero-width Unicode character: any of
-these will cause two keys that <em>look</em> identical to fail matching
-without a warning from R.</p>
-<p>We will walk through the problems joinspy catches, ordered roughly by
-frequency. String-level issues come first, then structural issues
+<p>Trailing spaces, flipped case, and zero-width Unicode characters make
+keys that look identical on screen compare as different during a
+join.</p>
+<p>This vignette covers the issues joinspy detects, ordered roughly by
+frequency. String-level issues come first, then structural ones
 (duplicates, NAs, type mismatches, Cartesian explosions).</p>
 <div id="trailing-and-leading-whitespace" class="section level2">
 <h2>Trailing and leading whitespace</h2>
@@ -910,15 +909,15 @@ into a million-row table.</p>
 <span id="cb22-14"><a href="#cb22-14" tabindex="-1"></a><span class="co">#&gt; ✔ No Cartesian product risk (expansion factor: 2x)</span></span></code></pre></div>
 <p><code>detect_cardinality()</code> tells us the relationship type:</p>
 <div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a><span class="fu">detect_cardinality</span>(items, payments, <span class="at">by =</span> <span class="st">&quot;order_id&quot;</span>)</span>
-<span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;m:m&quot;</span></span>
+<span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;n:m&quot;</span></span>
 <span id="cb23-3"><a href="#cb23-3" tabindex="-1"></a><span class="co">#&gt; Left duplicates: 2 key(s)</span></span>
 <span id="cb23-4"><a href="#cb23-4" tabindex="-1"></a><span class="co">#&gt; Right duplicates: 2 key(s)</span></span></code></pre></div>
 <p>If we expected a one-to-many relationship, <code>join_strict()</code>
 will stop us before the explosion happens:</p>
-<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a><span class="fu">join_strict</span>(items, payments, <span class="at">by =</span> <span class="st">&quot;order_id&quot;</span>, <span class="at">type =</span> <span class="st">&quot;left&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:m&quot;</span>)</span>
-<span id="cb24-2"><a href="#cb24-2" tabindex="-1"></a><span class="co">#&gt; Error:</span></span>
-<span id="cb24-3"><a href="#cb24-3" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected 1:m but found m:m</span></span>
-<span id="cb24-4"><a href="#cb24-4" tabindex="-1"></a><span class="co">#&gt;   Left duplicates: 2, Right duplicates: 2</span></span></code></pre></div>
+<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a><span class="fu">join_strict</span>(items, payments, <span class="at">by =</span> <span class="st">&quot;order_id&quot;</span>, <span class="at">type =</span> <span class="st">&quot;left&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:n&quot;</span>)</span>
+<span id="cb24-2"><a href="#cb24-2" tabindex="-1"></a><span class="co">#&gt; Error in `join_strict()`:</span></span>
+<span id="cb24-3"><a href="#cb24-3" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected &quot;1:n&quot; but found &quot;n:m&quot;.</span></span>
+<span id="cb24-4"><a href="#cb24-4" tabindex="-1"></a><span class="co">#&gt; ℹ Left duplicates: 2, right duplicates: 2.</span></span></code></pre></div>
 </div>
 <div id="no-matches-at-all" class="section level2">
 <h2>No matches at all</h2>

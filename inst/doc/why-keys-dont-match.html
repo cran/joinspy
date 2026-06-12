@@ -12,7 +12,7 @@
 
 <meta name="author" content="Gilles Colling" />
 
-<meta name="date" content="2026-03-31" />
+<meta name="date" content="2026-06-12" />
 
 <title>Why Your Keys Don’t Match</title>
 
@@ -341,19 +341,17 @@ code > span.er { color: #a61717; background-color: #e3d2d2; }
 
 <h1 class="title toc-ignore">Why Your Keys Don’t Match</h1>
 <h4 class="author">Gilles Colling</h4>
-<h4 class="date">2026-03-31</h4>
+<h4 class="date">2026-06-12</h4>
 
 
 
-<p>A join runs without error but the row count is off – rows vanished,
-or they multiplied. The columns look fine. The key values look identical
-in the console. <code>str()</code> reveals nothing useful.</p>
-<p>The problem is almost never the join logic. It is the strings. R’s
-<code>merge()</code> and dplyr’s <code>*_join()</code> compare key
-values byte-for-byte. When keys fail to match, they are genuinely
-different – the difference is just invisible: a trailing space, a case
-mismatch, a zero-width Unicode character with no visual
-representation.</p>
+<p>A join runs without error but the row count is wrong – fewer rows
+than expected, or more. The columns look fine. The key values look
+identical in the console.</p>
+<p>R’s <code>merge()</code> and dplyr’s <code>*_join()</code> compare
+key values byte-for-byte. When keys fail to match, they are genuinely
+different at the byte level: a trailing space, a case mismatch, or a
+zero-width Unicode character that occupies no screen width.</p>
 <p>This vignette walks through five scenarios where joins fail for
 string-level reasons that resist casual inspection. The data is
 synthetic; the patterns come from real pipelines.</p>
@@ -432,8 +430,8 @@ the situation before the join:</p>
 <span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a><span class="co">#&gt; </span></span>
 <span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a><span class="co">#&gt; ── Suggested Repairs ───────────────────────────────────────────────────────────</span></span>
 <span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="co">#&gt; # Standardize case:</span></span>
-<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a><span class="co">#&gt; x$email &lt;- tolower(x$email)</span></span>
-<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a><span class="co">#&gt; y$email &lt;- tolower(y$email)</span></span></code></pre></div>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a><span class="co">#&gt; x[[&quot;email&quot;]] &lt;- tolower(x[[&quot;email&quot;]])</span></span>
+<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a><span class="co">#&gt; y[[&quot;email&quot;]] &lt;- tolower(y[[&quot;email&quot;]])</span></span></code></pre></div>
 <p>Or we can use <code>join_repair()</code> directly, specifying case
 standardization:</p>
 <div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(</span>
@@ -488,7 +486,7 @@ countries fail to match a reference population table.</p>
 <p>The zero-width space after “India” and “France” occupies zero pixels.
 The non-breaking space after “Japan” renders like a regular space but is
 U+00A0, not U+0020 – <code>trimws()</code> will not always remove it.
-The merge shows the damage:</p>
+The merge reflects this:</p>
 <div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">merge</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>))</span>
 <span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a><span class="co">#&gt; [1] 3</span></span></code></pre></div>
 <p>Three of six countries match. <code>join_spy()</code> detects the
@@ -534,8 +532,8 @@ codes. The ETL join did not.</p>
 <span id="cb16-16"><a href="#cb16-16" tabindex="-1"></a>  <span class="at">quantity =</span> <span class="fu">c</span>(<span class="dv">5</span>, <span class="dv">3</span>, <span class="dv">7</span>, <span class="dv">2</span>, <span class="dv">4</span>, <span class="dv">6</span>, <span class="dv">1</span>, <span class="dv">8</span>),</span>
 <span id="cb16-17"><a href="#cb16-17" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
 <span id="cb16-18"><a href="#cb16-18" tabindex="-1"></a>)</span></code></pre></div>
-<p>The damage is partial – some codes match, some do not – which makes
-it harder to spot than a complete failure.</p>
+<p>Some codes match and some do not, which makes partial failures harder
+to spot than complete ones.</p>
 <div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(transactions, catalogue, <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>)</span></code></pre></div>
 <p>Here is where this scenario differs from the previous ones.
 <code>join_repair()</code> can fix the case issue, but it cannot insert
@@ -574,8 +572,8 @@ invisible characters). Inserting a dash into <code>&quot;WDG102&quot;</code>
 requires knowing the canonical format – that fix has to come from
 someone who understands the data.</p>
 </div>
-<div id="scenario-5-the-compound-key-trap" class="section level2">
-<h2>Scenario 5: The Compound Key Trap</h2>
+<div id="scenario-5-compound-keys" class="section level2">
+<h2>Scenario 5: Compound Keys</h2>
 <p>Two government datasets need to be linked: regional economic
 indicators and regional population estimates, keyed on region and year.
 The year column is numeric and matches without trouble. The region
@@ -601,9 +599,8 @@ will not match <code>&quot;Asia Pacific&quot;</code>.</p>
 <div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a>merged <span class="ot">&lt;-</span> <span class="fu">merge</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
 <span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a><span class="fu">nrow</span>(merged)</span>
 <span id="cb23-3"><a href="#cb23-3" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
-<p>Four rows instead of six. North America and Europe link correctly;
-Asia Pacific silently vanishes. Two-thirds of the data is present – just
-enough to look plausible.</p>
+<p>Four rows instead of six. North America and Europe match; Asia
+Pacific does not, because of the trailing space.</p>
 <p><code>join_spy()</code> pinpoints which column in the compound key
 has the problem:</p>
 <div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span></code></pre></div>
@@ -612,24 +609,22 @@ has the problem:</p>
 <span id="cb25-3"><a href="#cb25-3" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
 <span id="cb25-4"><a href="#cb25-4" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
 <span id="cb25-5"><a href="#cb25-5" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
-<p>Six rows. Compound keys are more fragile than single keys because the
-failure is partial: one clean column and one dirty column produces a
-result that looks reasonable but is quietly incomplete. The more columns
-in the key, the more places an invisible character can hide.</p>
+<p>Six rows. With compound keys, a string issue in any single column is
+enough to break the match. The more columns in the key, the more places
+a byte-level discrepancy can occur.</p>
 </div>
 <div id="the-pattern" class="section level2">
 <h2>The Pattern</h2>
 <p>These five scenarios share three properties. The data looks correct
 to standard inspection tools – <code>str()</code>,
 <code>summary()</code>, <code>print()</code> all render the values
-identically. The failure is silent – R does not warn when a merge drops
-rows because of invisible whitespace; it just returns fewer rows. And
-the fix is mechanical once the cause is known – trimming, lowercasing,
-or stripping invisible Unicode are all one-line operations.</p>
-<p><code>join_spy()</code> closes the gap between a thirty-second fix
-and the hours of confusion that precede it, particularly with data from
-external sources, manual entry, PDF extraction, or cross-system
-integrations.</p>
+identically. R returns fewer (or more) rows without a warning, because
+the key values genuinely differ at the byte level. And the fix is
+mechanical once the cause is known – trimming, lowercasing, or stripping
+invisible Unicode are all one-line operations.</p>
+<p><code>join_spy()</code> surfaces the cause directly, which is
+especially useful with data from external sources, manual entry, PDF
+extraction, or cross-system integrations.</p>
 </div>
 
 

@@ -226,7 +226,7 @@ detect_cardinality(items, payments, by = "order_id")
 
 ## ----error = TRUE-------------------------------------------------------------
 try({
-join_strict(items, payments, by = "order_id", type = "left", expect = "1:m")
+join_strict(items, payments, by = "order_id", type = "left", expect = "1:n")
 })
 
 ## -----------------------------------------------------------------------------

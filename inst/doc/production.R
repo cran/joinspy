@@ -117,7 +117,7 @@ result <- join_strict(
   products, line_items,
   by = "product_id",
   type = "left",
-  expect = "1:m"
+  expect = "1:n"
 )
 nrow(result)
 
@@ -133,7 +133,7 @@ join_strict(
   products_bad, line_items,
   by = "product_id",
   type = "left",
-  expect = "1:m"
+  expect = "1:n"
 )
 })
 
@@ -237,10 +237,10 @@ if (!keys_ok) {
 
 # --- Gate 2: cardinality check ---
 card <- detect_cardinality(orders, customers, by = "customer_id")
-if (card == "m:m") {
+if (card == "n:m") {
   set_log_file(NULL)
   unlink(pipeline_log)
-  stop("Unexpected m:m cardinality in orders-customers join", call. = FALSE)
+  stop("Unexpected n:m cardinality in orders-customers join", call. = FALSE)
 }
 
 # --- Join (with auto-logging via *_join_spy) ---
