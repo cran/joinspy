@@ -12,7 +12,7 @@
 
 <meta name="author" content="Gilles Colling" />
 
-<meta name="date" content="2026-06-12" />
+<meta name="date" content="2026-06-13" />
 
 <title>Working with Backends</title>
 
@@ -341,7 +341,7 @@ code > span.er { color: #a61717; background-color: #e3d2d2; }
 
 <h1 class="title toc-ignore">Working with Backends</h1>
 <h4 class="author">Gilles Colling</h4>
-<h4 class="date">2026-06-12</h4>
+<h4 class="date">2026-06-13</h4>
 
 
 
@@ -352,8 +352,14 @@ automatically. The diagnostic layer (<code>join_spy()</code>,
 <code>key_check()</code>, <code>join_explain()</code>, and friends) is
 backend-agnostic: it runs the same analysis regardless of what class the
 inputs are.</p>
-<p>We walk through detection, explicit overrides, and class preservation
-below.</p>
+<p>We walk through detection, the exact engine calls behind each
+wrapper, explicit overrides, and class preservation below. We then take
+the engine differences that survive the wrapper layer (column-name
+collisions, row ordering, NA-key matching) and demonstrate each one with
+output, so that switching backends mid-project holds no surprises. The
+vignette closes with how backends interact with
+<code>join_strict()</code> and the report flow, and with guidance on
+when an override earns its keep.</p>
 <div id="auto-detection" class="section level2">
 <h2>Auto-detection</h2>
 <p>When we call <code>left_join_spy()</code> or
@@ -361,6 +367,13 @@ below.</p>
 inspects the class of <code>x</code> and <code>y</code> and picks the
 backend according to a fixed priority: data.table &gt; tibble &gt; base
 R.</p>
+<p>The check itself is two <code>inherits()</code> calls. A
+<code>&quot;data.table&quot;</code> class on either input selects the data.table
+engine. When neither side is a data.table, an input inheriting from
+<code>&quot;tbl_df&quot;</code> hands the join to dplyr, and plain data frames
+fall through to base R, which needs nothing beyond what ships with R.
+Both dplyr and data.table sit in Suggests, so the base path works on an
+installation that has neither.</p>
 <p>data.table takes priority because its merge implementation depends on
 key handling, indexing, and reference semantics that a dplyr join would
 discard. dplyr, on the other hand, handles a coerced data.table without
@@ -419,6 +432,92 @@ wins:</p>
 <span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>mixed_result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_dt, customers_tbl, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
 <span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a><span class="fu">class</span>(mixed_result)</span>
 <span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span></code></pre></div>
+<p>A single data.table anywhere in the call decides the engine, even
+when the other input is a tibble.</p>
+</div>
+<div id="from-wrapper-to-engine-call" class="section level2">
+<h2>From wrapper to engine call</h2>
+<p>All five joining functions route through one internal dispatch point,
+so backend behavior is identical whether we call a
+<code>*_join_spy()</code> wrapper or <code>join_strict()</code>. The
+dispatch maps each join type onto the engine’s own interface:</p>
+<table>
+<colgroup>
+<col width="25%" />
+<col width="25%" />
+<col width="25%" />
+<col width="25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>joinspy call</th>
+<th><code>&quot;base&quot;</code></th>
+<th><code>&quot;dplyr&quot;</code></th>
+<th><code>&quot;data.table&quot;</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>left_join_spy()</code></td>
+<td><code>merge(x, y, all.x = TRUE)</code></td>
+<td><code>dplyr::left_join(x, y, by)</code></td>
+<td><code>merge(xdt, ydt, all.x = TRUE)</code></td>
+</tr>
+<tr class="even">
+<td><code>right_join_spy()</code></td>
+<td><code>merge(x, y, all.y = TRUE)</code></td>
+<td><code>dplyr::right_join(x, y, by)</code></td>
+<td><code>merge(xdt, ydt, all.y = TRUE)</code></td>
+</tr>
+<tr class="odd">
+<td><code>inner_join_spy()</code></td>
+<td><code>merge(x, y)</code></td>
+<td><code>dplyr::inner_join(x, y, by)</code></td>
+<td><code>merge(xdt, ydt, all = FALSE)</code></td>
+</tr>
+<tr class="even">
+<td><code>full_join_spy()</code></td>
+<td><code>merge(x, y, all.x = TRUE, all.y = TRUE)</code></td>
+<td><code>dplyr::full_join(x, y, by)</code></td>
+<td><code>merge(xdt, ydt, all = TRUE)</code></td>
+</tr>
+<tr class="odd">
+<td><code>join_strict(type = ...)</code></td>
+<td>as above, for <code>type</code></td>
+<td>as above</td>
+<td>as above</td>
+</tr>
+</tbody>
+</table>
+<p>In the data.table column, <code>xdt</code> and <code>ydt</code> are
+the inputs after <code>data.table::as.data.table()</code>, which passes
+an existing data.table through unchanged. The data.table engine
+therefore goes through <code>merge.data.table()</code>, the method
+data.table registers for base R’s <code>merge()</code> generic. It never
+touches the <code>y[x]</code> bracket-join syntax. Several behaviors
+people associate with data.table joins (the <code>i.</code> column
+prefix, joining on the table’s stored key) belong to the bracket syntax
+and do not appear here.</p>
+<p>A named <code>by</code> vector such as
+<code>c(&quot;id&quot; = &quot;customer_id&quot;)</code> works on every backend. Base R
+receives it as <code>by.x</code> and <code>by.y</code>, dplyr takes the
+named vector natively, and for data.table the right table’s key columns
+are renamed to the left table’s names before merging. In all three cases
+the result carries the left table’s key names; the right table’s name
+(<code>account_key</code> below) never surfaces in the output, whichever
+engine runs:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a>accounts <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>), <span class="at">balance =</span> <span class="fu">c</span>(<span class="dv">50</span>, <span class="dv">80</span>))</span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>holders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">account_key =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>), <span class="at">holder =</span> <span class="fu">c</span>(<span class="st">&quot;Ana&quot;</span>, <span class="st">&quot;Ben&quot;</span>))</span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a><span class="fu">names</span>(<span class="fu">left_join_spy</span>(accounts, holders, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;id&quot;</span> <span class="ot">=</span> <span class="st">&quot;account_key&quot;</span>),</span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a>                    <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb5-6"><a href="#cb5-6" tabindex="-1"></a><span class="co">#&gt; [1] &quot;id&quot;      &quot;balance&quot; &quot;holder&quot;</span></span></code></pre></div>
+<p>Anything passed through <code>...</code> lands in the engine call
+from the table above. That is the door for engine-specific arguments,
+several of which appear in the sections that follow: <code>sort</code>,
+<code>suffixes</code>, and <code>incomparables</code> for the two
+<code>merge()</code>-based engines; <code>na_matches</code>,
+<code>suffix</code>, and <code>relationship</code> for dplyr.</p>
 </div>
 <div id="explicit-override" class="section level2">
 <h2>Explicit override</h2>
@@ -427,34 +526,51 @@ wins:</p>
 valid values are <code>&quot;base&quot;</code>, <code>&quot;dplyr&quot;</code>, and
 <code>&quot;data.table&quot;</code>.</p>
 <p>We can force dplyr on plain data frames to get tibble output:</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
-<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a><span class="fu">class</span>(result)</span>
-<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.frame&quot;</span></span></code></pre></div>
-<p>Or force base R to sidestep dplyr’s many-to-many warning when we
-already know the expansion is intentional:</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a><span class="co"># These have a legitimate many-to-many relationship</span></span>
-<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>tags <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
-<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>  <span class="at">item_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">2</span>),</span>
-<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a>  <span class="at">tag =</span> <span class="fu">c</span>(<span class="st">&quot;red&quot;</span>, <span class="st">&quot;large&quot;</span>, <span class="st">&quot;small&quot;</span>)</span>
-<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a>)</span>
-<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a></span>
-<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a>prices <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
-<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a>  <span class="at">item_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
-<span id="cb6-9"><a href="#cb6-9" tabindex="-1"></a>  <span class="at">currency =</span> <span class="fu">c</span>(<span class="st">&quot;USD&quot;</span>, <span class="st">&quot;USD&quot;</span>, <span class="st">&quot;EUR&quot;</span>)</span>
-<span id="cb6-10"><a href="#cb6-10" tabindex="-1"></a>)</span>
-<span id="cb6-11"><a href="#cb6-11" tabindex="-1"></a></span>
-<span id="cb6-12"><a href="#cb6-12" tabindex="-1"></a><span class="co"># Force base R to avoid dplyr&#39;s many-to-many warning</span></span>
-<span id="cb6-13"><a href="#cb6-13" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(tags, prices, <span class="at">by =</span> <span class="st">&quot;item_id&quot;</span>,</span>
-<span id="cb6-14"><a href="#cb6-14" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;base&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb6-15"><a href="#cb6-15" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
-<span id="cb6-16"><a href="#cb6-16" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a><span class="fu">class</span>(result)</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.frame&quot;</span></span></code></pre></div>
+<p>Many-to-many keys are a place where the engines look like they should
+diverge. Called at the console, <code>dplyr::left_join()</code> warns
+when it detects an unexpected many-to-many relationship. Through joinspy
+no warning appears on any backend, because dplyr runs that check only
+for joins called directly from the user’s environment; a call that
+originates inside another package skips it. The joinspy report still
+flags the expansion: it counts the duplicate keys and predicts the
+multiplied row count before the engine runs.</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a><span class="co"># These have a legitimate many-to-many relationship</span></span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>tags <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>  <span class="at">item_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">2</span>),</span>
+<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a>  <span class="at">tag =</span> <span class="fu">c</span>(<span class="st">&quot;red&quot;</span>, <span class="st">&quot;large&quot;</span>, <span class="st">&quot;small&quot;</span>)</span>
+<span id="cb7-5"><a href="#cb7-5" tabindex="-1"></a>)</span>
+<span id="cb7-6"><a href="#cb7-6" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" tabindex="-1"></a>prices <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
+<span id="cb7-8"><a href="#cb7-8" tabindex="-1"></a>  <span class="at">item_id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">2</span>),</span>
+<span id="cb7-9"><a href="#cb7-9" tabindex="-1"></a>  <span class="at">currency =</span> <span class="fu">c</span>(<span class="st">&quot;USD&quot;</span>, <span class="st">&quot;USD&quot;</span>, <span class="st">&quot;EUR&quot;</span>)</span>
+<span id="cb7-10"><a href="#cb7-10" tabindex="-1"></a>)</span>
+<span id="cb7-11"><a href="#cb7-11" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(tags, prices, <span class="at">by =</span> <span class="st">&quot;item_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb7-13"><a href="#cb7-13" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
+<span id="cb7-14"><a href="#cb7-14" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
+<p>Three input rows became four, silently as far as dplyr is concerned;
+<code>last_report()</code> has the full story. To turn an expectation
+about key relationships into a hard requirement, dplyr’s
+<code>relationship</code> argument passes through <code>...</code> and
+keeps its teeth, since constraint violations are errors and errors fire
+no matter who calls the join:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a><span class="fu">left_join_spy</span>(tags, prices, <span class="at">by =</span> <span class="st">&quot;item_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>,</span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>              <span class="at">relationship =</span> <span class="st">&quot;one-to-one&quot;</span>)</span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a><span class="co">#&gt; Error in `join_fn()`:</span></span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="co">#&gt; ! Each row in `y` must match at most 1 row in `x`.</span></span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a><span class="co">#&gt; ℹ Row 1 of `y` matches multiple rows in `x`.</span></span></code></pre></div>
+<p><code>join_strict(expect = &quot;1:1&quot;)</code> does the same job with a
+single syntax across all three backends; we return to it below.</p>
 <p>Or force data.table on plain data frames for speed on large
 inputs:</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
-<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a><span class="fu">class</span>(result)</span>
-<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a><span class="fu">class</span>(result)</span>
+<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span></code></pre></div>
 <p>An explicit backend must be installed. Requesting
 <code>backend = &quot;dplyr&quot;</code> without dplyr will error, not silently
 fall back – auto-detection is a convenience, but an explicit override is
@@ -477,88 +593,88 @@ columns in place and returns the same class it received.</li>
 for the detected class.</li>
 </ul>
 <p>Here is a full cycle with base R data frames:</p>
-<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>messy_df <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1 &quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot; C-3&quot;</span>),</span>
-<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>),</span>
-<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a>)</span>
-<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a></span>
-<span id="cb8-7"><a href="#cb8-7" tabindex="-1"></a>lookup_df <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb8-8"><a href="#cb8-8" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1&quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot;C-3&quot;</span>),</span>
-<span id="cb8-9"><a href="#cb8-9" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Gamma&quot;</span>),</span>
-<span id="cb8-10"><a href="#cb8-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb8-11"><a href="#cb8-11" tabindex="-1"></a>)</span>
-<span id="cb8-12"><a href="#cb8-12" tabindex="-1"></a></span>
-<span id="cb8-13"><a href="#cb8-13" tabindex="-1"></a><span class="co"># 1. Diagnose</span></span>
-<span id="cb8-14"><a href="#cb8-14" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(messy_df, lookup_df, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
-<span id="cb8-15"><a href="#cb8-15" tabindex="-1"></a></span>
-<span id="cb8-16"><a href="#cb8-16" tabindex="-1"></a><span class="co"># 2. Repair</span></span>
-<span id="cb8-17"><a href="#cb8-17" tabindex="-1"></a>repaired_df <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(messy_df, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
-<span id="cb8-18"><a href="#cb8-18" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
-<span id="cb8-19"><a href="#cb8-19" tabindex="-1"></a><span class="fu">class</span>(repaired_df)  <span class="co"># still data.frame</span></span>
-<span id="cb8-20"><a href="#cb8-20" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.frame&quot;</span></span>
-<span id="cb8-21"><a href="#cb8-21" tabindex="-1"></a></span>
-<span id="cb8-22"><a href="#cb8-22" tabindex="-1"></a><span class="co"># 3. Join</span></span>
-<span id="cb8-23"><a href="#cb8-23" tabindex="-1"></a>joined_df <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(repaired_df, lookup_df, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb8-24"><a href="#cb8-24" tabindex="-1"></a><span class="fu">class</span>(joined_df)  <span class="co"># still data.frame</span></span>
-<span id="cb8-25"><a href="#cb8-25" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.frame&quot;</span></span>
-<span id="cb8-26"><a href="#cb8-26" tabindex="-1"></a>joined_df</span>
-<span id="cb8-27"><a href="#cb8-27" tabindex="-1"></a><span class="co">#&gt;   code value label</span></span>
-<span id="cb8-28"><a href="#cb8-28" tabindex="-1"></a><span class="co">#&gt; 1  A-1    10 Alpha</span></span>
-<span id="cb8-29"><a href="#cb8-29" tabindex="-1"></a><span class="co">#&gt; 2  B-2    20  Beta</span></span>
-<span id="cb8-30"><a href="#cb8-30" tabindex="-1"></a><span class="co">#&gt; 3  C-3    30 Gamma</span></span></code></pre></div>
-<p>The same cycle with tibbles:</p>
-<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>messy_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
-<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1 &quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot; C-3&quot;</span>),</span>
-<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>)</span>
-<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>)</span>
-<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a></span>
-<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a>lookup_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
-<span id="cb9-7"><a href="#cb9-7" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1&quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot;C-3&quot;</span>),</span>
-<span id="cb9-8"><a href="#cb9-8" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Gamma&quot;</span>)</span>
-<span id="cb9-9"><a href="#cb9-9" tabindex="-1"></a>)</span>
-<span id="cb9-10"><a href="#cb9-10" tabindex="-1"></a></span>
-<span id="cb9-11"><a href="#cb9-11" tabindex="-1"></a>repaired_tbl <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(messy_tbl, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
-<span id="cb9-12"><a href="#cb9-12" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
-<span id="cb9-13"><a href="#cb9-13" tabindex="-1"></a><span class="fu">class</span>(repaired_tbl)  <span class="co"># still tbl_df</span></span>
-<span id="cb9-14"><a href="#cb9-14" tabindex="-1"></a><span class="co">#&gt; [1] &quot;tbl_df&quot;     &quot;tbl&quot;        &quot;data.frame&quot;</span></span>
-<span id="cb9-15"><a href="#cb9-15" tabindex="-1"></a></span>
-<span id="cb9-16"><a href="#cb9-16" tabindex="-1"></a>joined_tbl <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(repaired_tbl, lookup_tbl, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb9-17"><a href="#cb9-17" tabindex="-1"></a><span class="fu">class</span>(joined_tbl)  <span class="co"># still tbl_df</span></span>
-<span id="cb9-18"><a href="#cb9-18" tabindex="-1"></a><span class="co">#&gt; [1] &quot;tbl_df&quot;     &quot;tbl&quot;        &quot;data.frame&quot;</span></span>
-<span id="cb9-19"><a href="#cb9-19" tabindex="-1"></a>joined_tbl</span>
-<span id="cb9-20"><a href="#cb9-20" tabindex="-1"></a><span class="co">#&gt; # A tibble: 3 × 3</span></span>
-<span id="cb9-21"><a href="#cb9-21" tabindex="-1"></a><span class="co">#&gt;   code  value label</span></span>
-<span id="cb9-22"><a href="#cb9-22" tabindex="-1"></a><span class="co">#&gt;   &lt;chr&gt; &lt;dbl&gt; &lt;chr&gt;</span></span>
-<span id="cb9-23"><a href="#cb9-23" tabindex="-1"></a><span class="co">#&gt; 1 A-1      10 Alpha</span></span>
-<span id="cb9-24"><a href="#cb9-24" tabindex="-1"></a><span class="co">#&gt; 2 B-2      20 Beta </span></span>
-<span id="cb9-25"><a href="#cb9-25" tabindex="-1"></a><span class="co">#&gt; 3 C-3      30 Gamma</span></span></code></pre></div>
-<p>And with data.tables:</p>
-<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>messy_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>messy_df <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
 <span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1 &quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot; C-3&quot;</span>),</span>
-<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>)</span>
-<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a>)</span>
-<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a></span>
-<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a>lookup_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
-<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1&quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot;C-3&quot;</span>),</span>
-<span id="cb10-8"><a href="#cb10-8" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Gamma&quot;</span>)</span>
-<span id="cb10-9"><a href="#cb10-9" tabindex="-1"></a>)</span>
-<span id="cb10-10"><a href="#cb10-10" tabindex="-1"></a></span>
-<span id="cb10-11"><a href="#cb10-11" tabindex="-1"></a>repaired_dt <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(messy_dt, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
-<span id="cb10-12"><a href="#cb10-12" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
-<span id="cb10-13"><a href="#cb10-13" tabindex="-1"></a><span class="fu">class</span>(repaired_dt)  <span class="co"># still data.table</span></span>
-<span id="cb10-14"><a href="#cb10-14" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>),</span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a>)</span>
+<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a>lookup_df <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb10-8"><a href="#cb10-8" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1&quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot;C-3&quot;</span>),</span>
+<span id="cb10-9"><a href="#cb10-9" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Gamma&quot;</span>),</span>
+<span id="cb10-10"><a href="#cb10-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb10-11"><a href="#cb10-11" tabindex="-1"></a>)</span>
+<span id="cb10-12"><a href="#cb10-12" tabindex="-1"></a></span>
+<span id="cb10-13"><a href="#cb10-13" tabindex="-1"></a><span class="co"># 1. Diagnose</span></span>
+<span id="cb10-14"><a href="#cb10-14" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(messy_df, lookup_df, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
 <span id="cb10-15"><a href="#cb10-15" tabindex="-1"></a></span>
-<span id="cb10-16"><a href="#cb10-16" tabindex="-1"></a>joined_dt <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(repaired_dt, lookup_dt, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb10-17"><a href="#cb10-17" tabindex="-1"></a><span class="fu">class</span>(joined_dt)  <span class="co"># still data.table</span></span>
-<span id="cb10-18"><a href="#cb10-18" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span>
-<span id="cb10-19"><a href="#cb10-19" tabindex="-1"></a>joined_dt</span>
-<span id="cb10-20"><a href="#cb10-20" tabindex="-1"></a><span class="co">#&gt; Key: &lt;code&gt;</span></span>
-<span id="cb10-21"><a href="#cb10-21" tabindex="-1"></a><span class="co">#&gt;      code value  label</span></span>
-<span id="cb10-22"><a href="#cb10-22" tabindex="-1"></a><span class="co">#&gt;    &lt;char&gt; &lt;num&gt; &lt;char&gt;</span></span>
-<span id="cb10-23"><a href="#cb10-23" tabindex="-1"></a><span class="co">#&gt; 1:    A-1    10  Alpha</span></span>
-<span id="cb10-24"><a href="#cb10-24" tabindex="-1"></a><span class="co">#&gt; 2:    B-2    20   Beta</span></span>
-<span id="cb10-25"><a href="#cb10-25" tabindex="-1"></a><span class="co">#&gt; 3:    C-3    30  Gamma</span></span></code></pre></div>
+<span id="cb10-16"><a href="#cb10-16" tabindex="-1"></a><span class="co"># 2. Repair</span></span>
+<span id="cb10-17"><a href="#cb10-17" tabindex="-1"></a>repaired_df <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(messy_df, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
+<span id="cb10-18"><a href="#cb10-18" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
+<span id="cb10-19"><a href="#cb10-19" tabindex="-1"></a><span class="fu">class</span>(repaired_df)  <span class="co"># still data.frame</span></span>
+<span id="cb10-20"><a href="#cb10-20" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.frame&quot;</span></span>
+<span id="cb10-21"><a href="#cb10-21" tabindex="-1"></a></span>
+<span id="cb10-22"><a href="#cb10-22" tabindex="-1"></a><span class="co"># 3. Join</span></span>
+<span id="cb10-23"><a href="#cb10-23" tabindex="-1"></a>joined_df <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(repaired_df, lookup_df, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-24"><a href="#cb10-24" tabindex="-1"></a><span class="fu">class</span>(joined_df)  <span class="co"># still data.frame</span></span>
+<span id="cb10-25"><a href="#cb10-25" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.frame&quot;</span></span>
+<span id="cb10-26"><a href="#cb10-26" tabindex="-1"></a>joined_df</span>
+<span id="cb10-27"><a href="#cb10-27" tabindex="-1"></a><span class="co">#&gt;   code value label</span></span>
+<span id="cb10-28"><a href="#cb10-28" tabindex="-1"></a><span class="co">#&gt; 1  A-1    10 Alpha</span></span>
+<span id="cb10-29"><a href="#cb10-29" tabindex="-1"></a><span class="co">#&gt; 2  B-2    20  Beta</span></span>
+<span id="cb10-30"><a href="#cb10-30" tabindex="-1"></a><span class="co">#&gt; 3  C-3    30 Gamma</span></span></code></pre></div>
+<p>The same cycle with tibbles:</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a>messy_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
+<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1 &quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot; C-3&quot;</span>),</span>
+<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>)</span>
+<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>)</span>
+<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a>lookup_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">tibble</span>(</span>
+<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1&quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot;C-3&quot;</span>),</span>
+<span id="cb11-8"><a href="#cb11-8" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Gamma&quot;</span>)</span>
+<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a>)</span>
+<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" tabindex="-1"></a>repaired_tbl <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(messy_tbl, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
+<span id="cb11-12"><a href="#cb11-12" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
+<span id="cb11-13"><a href="#cb11-13" tabindex="-1"></a><span class="fu">class</span>(repaired_tbl)  <span class="co"># still tbl_df</span></span>
+<span id="cb11-14"><a href="#cb11-14" tabindex="-1"></a><span class="co">#&gt; [1] &quot;tbl_df&quot;     &quot;tbl&quot;        &quot;data.frame&quot;</span></span>
+<span id="cb11-15"><a href="#cb11-15" tabindex="-1"></a></span>
+<span id="cb11-16"><a href="#cb11-16" tabindex="-1"></a>joined_tbl <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(repaired_tbl, lookup_tbl, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb11-17"><a href="#cb11-17" tabindex="-1"></a><span class="fu">class</span>(joined_tbl)  <span class="co"># still tbl_df</span></span>
+<span id="cb11-18"><a href="#cb11-18" tabindex="-1"></a><span class="co">#&gt; [1] &quot;tbl_df&quot;     &quot;tbl&quot;        &quot;data.frame&quot;</span></span>
+<span id="cb11-19"><a href="#cb11-19" tabindex="-1"></a>joined_tbl</span>
+<span id="cb11-20"><a href="#cb11-20" tabindex="-1"></a><span class="co">#&gt; # A tibble: 3 × 3</span></span>
+<span id="cb11-21"><a href="#cb11-21" tabindex="-1"></a><span class="co">#&gt;   code  value label</span></span>
+<span id="cb11-22"><a href="#cb11-22" tabindex="-1"></a><span class="co">#&gt;   &lt;chr&gt; &lt;dbl&gt; &lt;chr&gt;</span></span>
+<span id="cb11-23"><a href="#cb11-23" tabindex="-1"></a><span class="co">#&gt; 1 A-1      10 Alpha</span></span>
+<span id="cb11-24"><a href="#cb11-24" tabindex="-1"></a><span class="co">#&gt; 2 B-2      20 Beta </span></span>
+<span id="cb11-25"><a href="#cb11-25" tabindex="-1"></a><span class="co">#&gt; 3 C-3      30 Gamma</span></span></code></pre></div>
+<p>And with data.tables:</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a>messy_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
+<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1 &quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot; C-3&quot;</span>),</span>
+<span id="cb12-3"><a href="#cb12-3" tabindex="-1"></a>  <span class="at">value =</span> <span class="fu">c</span>(<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>)</span>
+<span id="cb12-4"><a href="#cb12-4" tabindex="-1"></a>)</span>
+<span id="cb12-5"><a href="#cb12-5" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" tabindex="-1"></a>lookup_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
+<span id="cb12-7"><a href="#cb12-7" tabindex="-1"></a>  <span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A-1&quot;</span>, <span class="st">&quot;B-2&quot;</span>, <span class="st">&quot;C-3&quot;</span>),</span>
+<span id="cb12-8"><a href="#cb12-8" tabindex="-1"></a>  <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;Alpha&quot;</span>, <span class="st">&quot;Beta&quot;</span>, <span class="st">&quot;Gamma&quot;</span>)</span>
+<span id="cb12-9"><a href="#cb12-9" tabindex="-1"></a>)</span>
+<span id="cb12-10"><a href="#cb12-10" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" tabindex="-1"></a>repaired_dt <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(messy_dt, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
+<span id="cb12-12"><a href="#cb12-12" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
+<span id="cb12-13"><a href="#cb12-13" tabindex="-1"></a><span class="fu">class</span>(repaired_dt)  <span class="co"># still data.table</span></span>
+<span id="cb12-14"><a href="#cb12-14" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span>
+<span id="cb12-15"><a href="#cb12-15" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" tabindex="-1"></a>joined_dt <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(repaired_dt, lookup_dt, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb12-17"><a href="#cb12-17" tabindex="-1"></a><span class="fu">class</span>(joined_dt)  <span class="co"># still data.table</span></span>
+<span id="cb12-18"><a href="#cb12-18" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span>
+<span id="cb12-19"><a href="#cb12-19" tabindex="-1"></a>joined_dt</span>
+<span id="cb12-20"><a href="#cb12-20" tabindex="-1"></a><span class="co">#&gt; Key: &lt;code&gt;</span></span>
+<span id="cb12-21"><a href="#cb12-21" tabindex="-1"></a><span class="co">#&gt;      code value  label</span></span>
+<span id="cb12-22"><a href="#cb12-22" tabindex="-1"></a><span class="co">#&gt;    &lt;char&gt; &lt;num&gt; &lt;char&gt;</span></span>
+<span id="cb12-23"><a href="#cb12-23" tabindex="-1"></a><span class="co">#&gt; 1:    A-1    10  Alpha</span></span>
+<span id="cb12-24"><a href="#cb12-24" tabindex="-1"></a><span class="co">#&gt; 2:    B-2    20   Beta</span></span>
+<span id="cb12-25"><a href="#cb12-25" tabindex="-1"></a><span class="co">#&gt; 3:    C-3    30  Gamma</span></span></code></pre></div>
 <p>When <code>join_repair()</code> receives both <code>x</code> and
 <code>y</code>, it returns a list with <code>$x</code> and
 <code>$y</code>, each preserving the class of the corresponding
@@ -571,6 +687,180 @@ the input class. Passing <code>backend = &quot;data.table&quot;</code> on a tibb
 returns a data.table, because that is what the data.table engine
 produces.</p>
 </div>
+<div id="backend-differences-demonstrated" class="section level2">
+<h2>Backend differences, demonstrated</h2>
+<p>The wrapper layer hides the engine interfaces and normalizes the
+column naming for named keys. The engines’ own conventions for the
+result pass through untouched: how name collisions are resolved, what
+order rows come back in, and whether NA keys match. Each of these is
+small enough to go unnoticed in a code review and large enough to change
+downstream results, so we show all three with output rather than assert
+them.</p>
+<div id="column-name-collisions" class="section level3">
+<h3>Column-name collisions</h3>
+<p>When a non-key column exists in both tables, every engine has to
+rename one of them. All three backends land on the same convention, the
+<code>.x</code>/<code>.y</code> suffix pair:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a>dup_left <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>), <span class="at">status =</span> <span class="fu">c</span>(<span class="st">&quot;open&quot;</span>, <span class="st">&quot;closed&quot;</span>))</span>
+<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a>dup_right <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>), <span class="at">status =</span> <span class="fu">c</span>(<span class="st">&quot;new&quot;</span>, <span class="st">&quot;old&quot;</span>))</span>
+<span id="cb13-3"><a href="#cb13-3" tabindex="-1"></a></span>
+<span id="cb13-4"><a href="#cb13-4" tabindex="-1"></a><span class="fu">names</span>(<span class="fu">left_join_spy</span>(dup_left, dup_right, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb13-5"><a href="#cb13-5" tabindex="-1"></a><span class="co">#&gt; [1] &quot;id&quot;       &quot;status.x&quot; &quot;status.y&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a><span class="fu">names</span>(<span class="fu">left_join_spy</span>(dup_left, dup_right, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb14-2"><a href="#cb14-2" tabindex="-1"></a>                    <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb14-3"><a href="#cb14-3" tabindex="-1"></a><span class="co">#&gt; [1] &quot;id&quot;       &quot;status.x&quot; &quot;status.y&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a><span class="fu">names</span>(<span class="fu">left_join_spy</span>(dup_left, dup_right, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a>                    <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb15-3"><a href="#cb15-3" tabindex="-1"></a><span class="co">#&gt; [1] &quot;id&quot;       &quot;status.x&quot; &quot;status.y&quot;</span></span></code></pre></div>
+<p>data.table users may expect an <code>i.</code> prefix on right-table
+columns. That prefix comes from the <code>y[x]</code> bracket join;
+<code>merge.data.table()</code> follows the suffix convention of base
+R’s <code>merge()</code>, and the data.table backend calls
+<code>merge()</code>. Column names in joinspy output are stable across
+backends.</p>
+<p>The suffix pair is configurable through <code>...</code>, with one
+spelling difference to keep in mind when migrating code: both
+<code>merge()</code> methods call the argument <code>suffixes</code>,
+dplyr calls it <code>suffix</code>.</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a><span class="fu">names</span>(<span class="fu">left_join_spy</span>(dup_left, dup_right, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>,</span>
+<span id="cb16-2"><a href="#cb16-2" tabindex="-1"></a>                    <span class="at">.quiet =</span> <span class="cn">TRUE</span>, <span class="at">suffix =</span> <span class="fu">c</span>(<span class="st">&quot;_current&quot;</span>, <span class="st">&quot;_incoming&quot;</span>)))</span>
+<span id="cb16-3"><a href="#cb16-3" tabindex="-1"></a><span class="co">#&gt; [1] &quot;id&quot;              &quot;status_current&quot;  &quot;status_incoming&quot;</span></span></code></pre></div>
+</div>
+<div id="row-ordering" class="section level3">
+<h3>Row ordering</h3>
+<p>Row order is the difference most likely to break code silently. Base
+R’s <code>merge()</code> sorts the result by the key columns. So does
+<code>merge.data.table()</code>, whose <code>sort</code> argument
+defaults to <code>TRUE</code>. dplyr keeps the left table’s row order.
+We join a left table whose ids arrive in the order 3, 1, 2:</p>
+<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a>lhs <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">3</span>, <span class="dv">1</span>, <span class="dv">2</span>), <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">30</span>, <span class="dv">10</span>, <span class="dv">20</span>))</span>
+<span id="cb17-2"><a href="#cb17-2" tabindex="-1"></a>rhs <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>), <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;a&quot;</span>, <span class="st">&quot;b&quot;</span>, <span class="st">&quot;c&quot;</span>))</span>
+<span id="cb17-3"><a href="#cb17-3" tabindex="-1"></a></span>
+<span id="cb17-4"><a href="#cb17-4" tabindex="-1"></a><span class="fu">left_join_spy</span>(lhs, rhs, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)<span class="sc">$</span>id</span>
+<span id="cb17-5"><a href="#cb17-5" tabindex="-1"></a><span class="co">#&gt; [1] 1 2 3</span></span></code></pre></div>
+<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" tabindex="-1"></a><span class="fu">left_join_spy</span>(lhs, rhs, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)<span class="sc">$</span>id</span>
+<span id="cb18-2"><a href="#cb18-2" tabindex="-1"></a><span class="co">#&gt; [1] 3 1 2</span></span></code></pre></div>
+<div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a><span class="fu">left_join_spy</span>(lhs, rhs, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)<span class="sc">$</span>id</span>
+<span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a><span class="co">#&gt; [1] 1 2 3</span></span></code></pre></div>
+<p>Only dplyr returns the rows the way they arrived. For the merge-based
+engines, <code>sort = FALSE</code> passes through <code>...</code>:</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" tabindex="-1"></a><span class="fu">left_join_spy</span>(lhs, rhs, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>,</span>
+<span id="cb20-2"><a href="#cb20-2" tabindex="-1"></a>              <span class="at">.quiet =</span> <span class="cn">TRUE</span>, <span class="at">sort =</span> <span class="cn">FALSE</span>)<span class="sc">$</span>id</span>
+<span id="cb20-3"><a href="#cb20-3" tabindex="-1"></a><span class="co">#&gt; [1] 3 1 2</span></span></code></pre></div>
+<p>data.table documents the unsorted result as keeping <code>x</code>’s
+row order. Base R documents it as unspecified, so unsorted
+<code>merge()</code> output should be treated as arbitrary even when it
+happens to look right. Any pipeline that indexes join output by row
+position will give different answers under base or data.table than under
+dplyr; an explicit <code>order()</code> after the join, or joining on a
+key downstream instead of relying on position, makes the assumption
+visible and removes the hazard.</p>
+</div>
+<div id="na-keys-match-each-other" class="section level3">
+<h3>NA keys match each other</h3>
+<p>All three engines treat NA as a matchable value by default. An NA key
+on the left joins to an NA key on the right:</p>
+<div class="sourceCode" id="cb21"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" tabindex="-1"></a>na_left <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="cn">NA</span>), <span class="at">v =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>))</span>
+<span id="cb21-2"><a href="#cb21-2" tabindex="-1"></a>na_right <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">code =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="cn">NA</span>), <span class="at">label =</span> <span class="fu">c</span>(<span class="st">&quot;alpha&quot;</span>, <span class="st">&quot;missing&quot;</span>))</span>
+<span id="cb21-3"><a href="#cb21-3" tabindex="-1"></a></span>
+<span id="cb21-4"><a href="#cb21-4" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">inner_join_spy</span>(na_left, na_right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb21-5"><a href="#cb21-5" tabindex="-1"></a><span class="co">#&gt; [1] 2</span></span></code></pre></div>
+<div class="sourceCode" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">inner_join_spy</span>(na_left, na_right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>,</span>
+<span id="cb22-2"><a href="#cb22-2" tabindex="-1"></a>                    <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb22-3"><a href="#cb22-3" tabindex="-1"></a><span class="co">#&gt; [1] 2</span></span></code></pre></div>
+<div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a><span class="fu">inner_join_spy</span>(na_left, na_right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>,</span>
+<span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a>               <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb23-3"><a href="#cb23-3" tabindex="-1"></a><span class="co">#&gt; Key: &lt;code&gt;</span></span>
+<span id="cb23-4"><a href="#cb23-4" tabindex="-1"></a><span class="co">#&gt;      code     v   label</span></span>
+<span id="cb23-5"><a href="#cb23-5" tabindex="-1"></a><span class="co">#&gt;    &lt;char&gt; &lt;num&gt;  &lt;char&gt;</span></span>
+<span id="cb23-6"><a href="#cb23-6" tabindex="-1"></a><span class="co">#&gt; 1:   &lt;NA&gt;     2 missing</span></span>
+<span id="cb23-7"><a href="#cb23-7" tabindex="-1"></a><span class="co">#&gt; 2:      A     1   alpha</span></span></code></pre></div>
+<p>Two rows on every backend; the NA-to-NA pair survives the inner join.
+The data.table output also shows its key sort placing the NA row
+first.</p>
+<p>joinspy’s row predictions take the opposite stance.
+<code>join_spy()</code> counts NA keys separately, reports them as an
+issue, and predicts row counts as if they match nothing:</p>
+<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(na_left, na_right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>)</span>
+<span id="cb24-2"><a href="#cb24-2" tabindex="-1"></a>report<span class="sc">$</span>expected_rows<span class="sc">$</span>inner</span>
+<span id="cb24-3"><a href="#cb24-3" tabindex="-1"></a><span class="co">#&gt; [1] 1</span></span></code></pre></div>
+<p>The predicted inner join has 1 row; the engines return 2. In a
+verbose wrapper call this surfaces as a
+<code>Result: 2 rows (expected 1)</code> flag, which is exactly the
+discrepancy the wrapper exists to catch, since NA-on-NA matches are a
+classic source of phantom rows. To make the engines agree with the
+prediction, two pass-through arguments drop NA matches:
+<code>na_matches = &quot;never&quot;</code> for dplyr, and
+<code>incomparables = NA</code> for both <code>merge()</code>-based
+engines (single-key joins only):</p>
+<div class="sourceCode" id="cb25"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb25-1"><a href="#cb25-1" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">inner_join_spy</span>(na_left, na_right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>,</span>
+<span id="cb25-2"><a href="#cb25-2" tabindex="-1"></a>                    <span class="at">.quiet =</span> <span class="cn">TRUE</span>, <span class="at">na_matches =</span> <span class="st">&quot;never&quot;</span>))</span>
+<span id="cb25-3"><a href="#cb25-3" tabindex="-1"></a><span class="co">#&gt; [1] 1</span></span></code></pre></div>
+<div class="sourceCode" id="cb26"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">inner_join_spy</span>(na_left, na_right, <span class="at">by =</span> <span class="st">&quot;code&quot;</span>, <span class="at">backend =</span> <span class="st">&quot;base&quot;</span>,</span>
+<span id="cb26-2"><a href="#cb26-2" tabindex="-1"></a>                    <span class="at">.quiet =</span> <span class="cn">TRUE</span>, <span class="at">incomparables =</span> <span class="cn">NA</span>))</span>
+<span id="cb26-3"><a href="#cb26-3" tabindex="-1"></a><span class="co">#&gt; [1] 1</span></span></code></pre></div>
+<p>For composite keys, where <code>incomparables</code> no longer
+applies, filtering NA keys before the join with
+<code>complete.cases()</code> on the key columns is the portable route.
+The report’s NA-key counts say up front how many rows such a filter
+would touch.</p>
+</div>
+</div>
+<div id="join_strict-.quiet-and-the-report-flow" class="section level2">
+<h2>join_strict(), .quiet, and the report flow</h2>
+<p>Every wrapper computes the diagnostic report before any engine runs.
+All four <code>*_join_spy()</code> functions share one implementation
+that calls <code>join_spy()</code> first, stores the result, and only
+then dispatches the join. The <code>backend</code> argument affects the
+second step alone, so the report is identical whichever engine performs
+the join:</p>
+<div class="sourceCode" id="cb27"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb27-1"><a href="#cb27-1" tabindex="-1"></a><span class="fu">invisible</span>(<span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb27-2"><a href="#cb27-2" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;base&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb27-3"><a href="#cb27-3" tabindex="-1"></a>report_base <span class="ot">&lt;-</span> <span class="fu">last_report</span>()</span>
+<span id="cb27-4"><a href="#cb27-4" tabindex="-1"></a></span>
+<span id="cb27-5"><a href="#cb27-5" tabindex="-1"></a><span class="fu">invisible</span>(<span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb27-6"><a href="#cb27-6" tabindex="-1"></a>                        <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb27-7"><a href="#cb27-7" tabindex="-1"></a>report_dplyr <span class="ot">&lt;-</span> <span class="fu">last_report</span>()</span>
+<span id="cb27-8"><a href="#cb27-8" tabindex="-1"></a></span>
+<span id="cb27-9"><a href="#cb27-9" tabindex="-1"></a><span class="fu">identical</span>(report_base<span class="sc">$</span>expected_rows, report_dplyr<span class="sc">$</span>expected_rows)</span>
+<span id="cb27-10"><a href="#cb27-10" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span></code></pre></div>
+<p><code>.quiet = TRUE</code> suppresses the printing and nothing else.
+The report is still computed. It remains available through
+<code>last_report()</code>, travels with the result as the
+<code>&quot;join_report&quot;</code> attribute, and goes to the log whenever
+<code>set_log_file()</code> is active. A quiet data.table join leaves
+the same audit trail as a verbose dplyr one.</p>
+<div class="sourceCode" id="cb28"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_df, customers_df, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-2"><a href="#cb28-2" tabindex="-1"></a><span class="fu">is_join_report</span>(<span class="fu">attr</span>(result, <span class="st">&quot;join_report&quot;</span>))</span>
+<span id="cb28-3"><a href="#cb28-3" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span></code></pre></div>
+<p>In verbose mode the wrapper finishes by comparing the engine’s actual
+row count against the report’s prediction for the chosen join type.
+Because the prediction is backend-independent, this check doubles as a
+guard against the engine differences from the previous section: an NA
+key that matched, or a duplicate that multiplied, shows up as a
+predicted-versus-actual gap whatever the backend.</p>
+<p><code>join_strict()</code> slots into the same flow one step earlier.
+It summarizes the keys, classifies the actual cardinality, and raises an
+error before any engine is chosen when the <code>expect</code> contract
+is violated. The error message is the same on every backend because no
+backend has run yet. Here we request data.table and still fail at the
+cardinality gate:</p>
+<div class="sourceCode" id="cb29"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb29-1"><a href="#cb29-1" tabindex="-1"></a>products <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>, <span class="at">product =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>, <span class="st">&quot;C&quot;</span>))</span>
+<span id="cb29-2"><a href="#cb29-2" tabindex="-1"></a>suppliers_dup <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">1</span>, <span class="dv">2</span>), <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;S1&quot;</span>, <span class="st">&quot;S2&quot;</span>, <span class="st">&quot;S3&quot;</span>))</span>
+<span id="cb29-3"><a href="#cb29-3" tabindex="-1"></a></span>
+<span id="cb29-4"><a href="#cb29-4" tabindex="-1"></a><span class="fu">join_strict</span>(products, suppliers_dup, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:1&quot;</span>,</span>
+<span id="cb29-5"><a href="#cb29-5" tabindex="-1"></a>            <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>)</span>
+<span id="cb29-6"><a href="#cb29-6" tabindex="-1"></a><span class="co">#&gt; Error in `join_strict()`:</span></span>
+<span id="cb29-7"><a href="#cb29-7" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected &quot;1:1&quot; but found &quot;1:n&quot;.</span></span>
+<span id="cb29-8"><a href="#cb29-8" tabindex="-1"></a><span class="co">#&gt; ℹ Left duplicates: 0, right duplicates: 1.</span></span></code></pre></div>
+<p>When the contract holds, the join proceeds through the same dispatch
+as the wrappers and returns the native class:</p>
+<div class="sourceCode" id="cb30"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" tabindex="-1"></a>products_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(<span class="at">id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>, <span class="at">product =</span> <span class="fu">c</span>(<span class="st">&quot;A&quot;</span>, <span class="st">&quot;B&quot;</span>, <span class="st">&quot;C&quot;</span>))</span>
+<span id="cb30-2"><a href="#cb30-2" tabindex="-1"></a>suppliers_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(<span class="at">id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>, <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;S1&quot;</span>, <span class="st">&quot;S2&quot;</span>, <span class="st">&quot;S3&quot;</span>))</span>
+<span id="cb30-3"><a href="#cb30-3" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" tabindex="-1"></a><span class="fu">class</span>(<span class="fu">join_strict</span>(products_dt, suppliers_dt, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">expect =</span> <span class="st">&quot;1:1&quot;</span>))</span>
+<span id="cb30-5"><a href="#cb30-5" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span></code></pre></div>
+</div>
 <div id="diagnostics-are-backend-agnostic" class="section level2">
 <h2>Diagnostics are backend-agnostic</h2>
 <p>The diagnostic functions (<code>join_spy()</code>,
@@ -582,47 +872,102 @@ input class.</p>
 <p>This means we can diagnose on data.tables and join with dplyr, or
 diagnose in a base-R script and pass the data to a Shiny app that uses
 dplyr internally.</p>
-<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a><span class="co"># Diagnose on data.tables</span></span>
-<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a>orders_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
-<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>  <span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>),</span>
-<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">100</span>, <span class="dv">250</span>, <span class="dv">75</span>)</span>
-<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a>)</span>
-<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a></span>
-<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a>customers_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
-<span id="cb11-8"><a href="#cb11-8" tabindex="-1"></a>  <span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">4</span>),</span>
-<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Alice&quot;</span>, <span class="st">&quot;Bob&quot;</span>, <span class="st">&quot;Diana&quot;</span>)</span>
-<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a>)</span>
-<span id="cb11-11"><a href="#cb11-11" tabindex="-1"></a></span>
-<span id="cb11-12"><a href="#cb11-12" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(orders_dt, customers_dt, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>)</span>
-<span id="cb11-13"><a href="#cb11-13" tabindex="-1"></a></span>
-<span id="cb11-14"><a href="#cb11-14" tabindex="-1"></a><span class="co"># Join with dplyr (convert first)</span></span>
-<span id="cb11-15"><a href="#cb11-15" tabindex="-1"></a>orders_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">as_tibble</span>(orders_dt)</span>
-<span id="cb11-16"><a href="#cb11-16" tabindex="-1"></a>customers_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">as_tibble</span>(customers_dt)</span>
-<span id="cb11-17"><a href="#cb11-17" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_tbl, customers_tbl, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb11-18"><a href="#cb11-18" tabindex="-1"></a><span class="fu">class</span>(result)</span>
-<span id="cb11-19"><a href="#cb11-19" tabindex="-1"></a><span class="co">#&gt; [1] &quot;tbl_df&quot;     &quot;tbl&quot;        &quot;data.frame&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb31"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb31-1"><a href="#cb31-1" tabindex="-1"></a><span class="co"># Diagnose on data.tables</span></span>
+<span id="cb31-2"><a href="#cb31-2" tabindex="-1"></a>orders_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
+<span id="cb31-3"><a href="#cb31-3" tabindex="-1"></a>  <span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>),</span>
+<span id="cb31-4"><a href="#cb31-4" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">100</span>, <span class="dv">250</span>, <span class="dv">75</span>)</span>
+<span id="cb31-5"><a href="#cb31-5" tabindex="-1"></a>)</span>
+<span id="cb31-6"><a href="#cb31-6" tabindex="-1"></a></span>
+<span id="cb31-7"><a href="#cb31-7" tabindex="-1"></a>customers_dt <span class="ot">&lt;-</span> data.table<span class="sc">::</span><span class="fu">data.table</span>(</span>
+<span id="cb31-8"><a href="#cb31-8" tabindex="-1"></a>  <span class="at">id =</span> <span class="fu">c</span>(<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">4</span>),</span>
+<span id="cb31-9"><a href="#cb31-9" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Alice&quot;</span>, <span class="st">&quot;Bob&quot;</span>, <span class="st">&quot;Diana&quot;</span>)</span>
+<span id="cb31-10"><a href="#cb31-10" tabindex="-1"></a>)</span>
+<span id="cb31-11"><a href="#cb31-11" tabindex="-1"></a></span>
+<span id="cb31-12"><a href="#cb31-12" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(orders_dt, customers_dt, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>)</span>
+<span id="cb31-13"><a href="#cb31-13" tabindex="-1"></a></span>
+<span id="cb31-14"><a href="#cb31-14" tabindex="-1"></a><span class="co"># Join with dplyr (convert first)</span></span>
+<span id="cb31-15"><a href="#cb31-15" tabindex="-1"></a>orders_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">as_tibble</span>(orders_dt)</span>
+<span id="cb31-16"><a href="#cb31-16" tabindex="-1"></a>customers_tbl <span class="ot">&lt;-</span> dplyr<span class="sc">::</span><span class="fu">as_tibble</span>(customers_dt)</span>
+<span id="cb31-17"><a href="#cb31-17" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders_tbl, customers_tbl, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb31-18"><a href="#cb31-18" tabindex="-1"></a><span class="fu">class</span>(result)</span>
+<span id="cb31-19"><a href="#cb31-19" tabindex="-1"></a><span class="co">#&gt; [1] &quot;tbl_df&quot;     &quot;tbl&quot;        &quot;data.frame&quot;</span></span></code></pre></div>
 <p>The report object is structurally identical across backends –
 <code>$issues</code>, <code>$expected_rows</code>, and
 <code>$match_analysis</code> contain the same values. This also means we
 can write unit tests for key quality using plain data frames even when
 production code uses data.table.</p>
 </div>
-<div id="backend-differences-at-a-glance" class="section level2">
-<h2>Backend differences at a glance</h2>
-<p>The three backends differ in a few ways worth noting:</p>
-<ul>
-<li><strong>Column name collisions.</strong> Base R and dplyr append
-<code>.x</code>/<code>.y</code> suffixes; data.table appends
-<code>i.</code> to right-table columns.</li>
-<li><strong>Row ordering.</strong> Base R sorts by key; dplyr preserves
-left-table order; data.table sorts by key if keyed, otherwise preserves
-insertion order.</li>
-<li><strong>Performance.</strong> data.table is the fastest for large
-inputs. Base R and dplyr are comparable for small to medium
-datasets.</li>
-</ul>
-<p>If we switch backends mid-project, it is worth checking that column
-references and row-order assumptions still hold.</p>
+<div id="choosing-a-backend" class="section level2">
+<h2>Choosing a backend</h2>
+<p>Auto-detection is the right default. It keeps the output class
+aligned with the input class, it never errors over a missing package,
+and the same script behaves sensibly whether a colleague feeds it
+tibbles or data.tables. The override is for cases where the engine
+itself matters.</p>
+<p><code>backend = &quot;base&quot;</code> removes dplyr and data.table from the
+execution path. A script that must run on a minimal R installation, a
+package that wants joinspy without inheriting heavier dependencies, and
+a frozen reproducibility archive are all served by base R’s
+<code>merge()</code>, whose join semantics have been stable for decades.
+Forcing base is also one way to reach <code>merge()</code>-only
+arguments on inputs that would otherwise auto-detect to dplyr.</p>
+<p><code>backend = &quot;dplyr&quot;</code> buys the <code>relationship</code> and
+<code>na_matches</code> controls shown above, plus tibble output for
+pipelines that expect it. When the surrounding code is dplyr anyway,
+matching the backend keeps a single join grammar in play.</p>
+<p><code>backend = &quot;data.table&quot;</code> matters when the output feeds
+by-reference operations (<code>:=</code>,
+<code>data.table::setkey()</code>) that require a genuine data.table, or
+when the tables are large enough for engine speed to register at all.
+Inside joinspy that point arrives later than expected, because the
+wrapper spends most of its time on diagnostics rather than on the join.
+We can measure this directly: the chunk times the same 5,000-row join on
+each backend, then times the diagnostic pass alone.</p>
+<div class="sourceCode" id="cb32"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb32-1"><a href="#cb32-1" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">42</span>)</span>
+<span id="cb32-2"><a href="#cb32-2" tabindex="-1"></a>n <span class="ot">&lt;-</span> <span class="dv">5000</span></span>
+<span id="cb32-3"><a href="#cb32-3" tabindex="-1"></a>big_x <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">sample</span>(n), <span class="at">x =</span> <span class="fu">rnorm</span>(n))</span>
+<span id="cb32-4"><a href="#cb32-4" tabindex="-1"></a>big_y <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">sample</span>(n), <span class="at">y =</span> <span class="fu">rnorm</span>(n))</span>
+<span id="cb32-5"><a href="#cb32-5" tabindex="-1"></a></span>
+<span id="cb32-6"><a href="#cb32-6" tabindex="-1"></a>t_base <span class="ot">&lt;-</span> <span class="fu">system.time</span>(<span class="fu">left_join_spy</span>(big_x, big_y, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb32-7"><a href="#cb32-7" tabindex="-1"></a>                                    <span class="at">backend =</span> <span class="st">&quot;base&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb32-8"><a href="#cb32-8" tabindex="-1"></a>t_dplyr <span class="ot">&lt;-</span> <span class="fu">system.time</span>(<span class="fu">left_join_spy</span>(big_x, big_y, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb32-9"><a href="#cb32-9" tabindex="-1"></a>                                     <span class="at">backend =</span> <span class="st">&quot;dplyr&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb32-10"><a href="#cb32-10" tabindex="-1"></a>t_dt <span class="ot">&lt;-</span> <span class="fu">system.time</span>(<span class="fu">left_join_spy</span>(big_x, big_y, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb32-11"><a href="#cb32-11" tabindex="-1"></a>                                  <span class="at">backend =</span> <span class="st">&quot;data.table&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb32-12"><a href="#cb32-12" tabindex="-1"></a>t_spy <span class="ot">&lt;-</span> <span class="fu">system.time</span>(report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(big_x, big_y, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>))</span>
+<span id="cb32-13"><a href="#cb32-13" tabindex="-1"></a></span>
+<span id="cb32-14"><a href="#cb32-14" tabindex="-1"></a><span class="fu">round</span>(<span class="fu">c</span>(<span class="at">base =</span> t_base[[<span class="st">&quot;elapsed&quot;</span>]], <span class="at">dplyr =</span> t_dplyr[[<span class="st">&quot;elapsed&quot;</span>]],</span>
+<span id="cb32-15"><a href="#cb32-15" tabindex="-1"></a>        <span class="at">data.table =</span> t_dt[[<span class="st">&quot;elapsed&quot;</span>]], <span class="at">diagnostics =</span> t_spy[[<span class="st">&quot;elapsed&quot;</span>]]), <span class="dv">3</span>)</span>
+<span id="cb32-16"><a href="#cb32-16" tabindex="-1"></a><span class="co">#&gt;        base       dplyr  data.table diagnostics </span></span>
+<span id="cb32-17"><a href="#cb32-17" tabindex="-1"></a><span class="co">#&gt;        0.31        0.29        0.33        0.32</span></span></code></pre></div>
+<p>The three wrapper timings land close together, and the last entry
+shows why: most of the elapsed time is <code>join_spy()</code> scanning
+keys, with the engine merge accounting for the remainder. Two
+consequences follow. Switching backends to speed up a
+<code>*_join_spy()</code> call addresses the smaller term. And on
+genuinely large tables the lever sits on the diagnostic side:
+<code>join_spy()</code> accepts a <code>sample</code> argument for
+approximate diagnostics on a row subset, after which the engine of
+choice can be called directly on the full data.</p>
+<p>Two cautions before overriding. First, an explicit backend determines
+the output class regardless of input class:
+<code>backend = &quot;data.table&quot;</code> on tibbles returns a data.table, and
+downstream tibble-flavored code may misbehave. Second,
+<code>backend = &quot;base&quot;</code> selects base R’s <code>merge()</code>
+generic, and S3 dispatch inside <code>merge()</code> still routes
+data.table inputs to data.table’s own method:</p>
+<div class="sourceCode" id="cb33"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb33-1"><a href="#cb33-1" tabindex="-1"></a><span class="fu">class</span>(<span class="fu">left_join_spy</span>(orders_dt, customers_dt, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb33-2"><a href="#cb33-2" tabindex="-1"></a>                    <span class="at">backend =</span> <span class="st">&quot;base&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>))</span>
+<span id="cb33-3"><a href="#cb33-3" tabindex="-1"></a><span class="co">#&gt; [1] &quot;data.table&quot; &quot;data.frame&quot;</span></span></code></pre></div>
+<p>A data.table input runs <code>merge.data.table()</code> even under
+<code>backend = &quot;base&quot;</code>. Stripping the class first with
+<code>as.data.frame()</code> is the way to reach the data.frame method.
+The same dispatch rule applies to tibbles, harmlessly: tibbles register
+no <code>merge()</code> method of their own, so the data.frame method
+runs. Auto-detection already picks the engine that respects the richest
+input class, which is why leaving the <code>backend</code> argument
+alone is the recommendation for everything except the deliberate cases
+above.</p>
 </div>
 <div id="see-also" class="section level2">
 <h2>See Also</h2>

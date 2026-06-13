@@ -8,6 +8,68 @@ knitr::opts_chunk$set(
 library(joinspy)
 
 ## -----------------------------------------------------------------------------
+a <- "CUST-1002"
+b <- "CUST-1002 "
+identical(a, b)
+c(nchar(a), nchar(b))
+
+## -----------------------------------------------------------------------------
+charToRaw(b)
+
+## -----------------------------------------------------------------------------
+space <- "\u0020"
+nbsp <- "\u00A0"
+space == nbsp
+c(utf8ToInt(space), utf8ToInt(nbsp))
+
+## -----------------------------------------------------------------------------
+e_one <- "\u00E9"
+e_two <- "e\u0301"
+e_one
+e_two
+e_one == e_two
+
+## -----------------------------------------------------------------------------
+c(nchar(e_one), nchar(e_two))
+utf8ToInt(e_one)
+utf8ToInt(e_two)
+
+## -----------------------------------------------------------------------------
+city_utf8 <- "Z\u00FCrich"
+city_latin1 <- iconv(city_utf8, from = "UTF-8", to = "latin1")
+c(Encoding(city_utf8), Encoding(city_latin1))
+charToRaw(city_utf8)
+charToRaw(city_latin1)
+
+## -----------------------------------------------------------------------------
+city_utf8 == city_latin1
+
+## -----------------------------------------------------------------------------
+ids <- c("CUST-1001", "CUST-1002 ", " CUST-1004")
+grepl("^\\s+", ids)
+grepl("\\s+$", ids)
+
+## -----------------------------------------------------------------------------
+crm <- c("ALICE@ACME.COM", "EVE@ACME.COM")
+clicks <- c("alice@acme.com", "frank@acme.com")
+crm[tolower(crm) %in% tolower(clicks)]
+
+## -----------------------------------------------------------------------------
+hidden <- "[\u200B\u200C\u200D\uFEFF\u00A0]"
+grepl(hidden, c("India\u200B", "India"), perl = TRUE)
+
+## -----------------------------------------------------------------------------
+c("" == "", "" == NA)
+
+## -----------------------------------------------------------------------------
+0.1 + 0.2 == 0.3
+2^53 == 2^53 + 1
+
+## -----------------------------------------------------------------------------
+utils::adist("WDG102", "WDG-102")
+utils::adist("Asia Pacific ", "Asia Pacific")
+
+## -----------------------------------------------------------------------------
 partner_sales <- data.frame(
   customer_id = c("CUST-1001", "CUST-1002 ", "CUST-1003",
                   " CUST-1004", "CUST-1005 ", "CUST-1006"),
@@ -24,6 +86,7 @@ internal_db <- data.frame(
 
 ## -----------------------------------------------------------------------------
 report <- join_spy(partner_sales, internal_db, by = "customer_id")
+report
 
 ## -----------------------------------------------------------------------------
 repaired <- join_repair(partner_sales, internal_db, by = "customer_id")
@@ -54,6 +117,7 @@ click_events <- data.frame(
 
 ## -----------------------------------------------------------------------------
 report <- join_spy(crm_profiles, click_events, by = "email")
+report
 
 ## -----------------------------------------------------------------------------
 suggest_repairs(report)
@@ -95,6 +159,7 @@ nrow(merge(pdf_data, reference, by = "country"))
 
 ## -----------------------------------------------------------------------------
 report <- join_spy(pdf_data, reference, by = "country")
+report
 
 ## -----------------------------------------------------------------------------
 repaired <- join_repair(pdf_data, reference, by = "country")
@@ -122,6 +187,7 @@ transactions <- data.frame(
 
 ## -----------------------------------------------------------------------------
 report <- join_spy(transactions, catalogue, by = "product_code")
+report
 
 ## -----------------------------------------------------------------------------
 join_repair(transactions, catalogue,
@@ -168,6 +234,7 @@ nrow(merged)
 
 ## -----------------------------------------------------------------------------
 report <- join_spy(economics, population, by = c("region", "year"))
+report
 
 ## -----------------------------------------------------------------------------
 repaired <- join_repair(economics, population, by = c("region", "year"))

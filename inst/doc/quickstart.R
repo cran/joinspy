@@ -20,7 +20,7 @@ cities <- data.frame(
   stringsAsFactors = FALSE
 )
 
-report <- join_spy(sales, cities, by = "city")
+join_spy(sales, cities, by = "city")
 
 ## -----------------------------------------------------------------------------
 sales2 <- data.frame(
@@ -37,10 +37,29 @@ districts <- data.frame(
   stringsAsFactors = FALSE
 )
 
-report <- join_spy(sales2, districts, by = c("city", "district"))
+join_spy(sales2, districts, by = c("city", "district"))
 
 ## -----------------------------------------------------------------------------
 key_check(sales, cities, by = "city")
+
+## -----------------------------------------------------------------------------
+ok <- key_check(sales, cities, by = "city", warn = FALSE)
+ok
+
+## -----------------------------------------------------------------------------
+sales_reps <- data.frame(
+  id = c("C1", "C2", "C3"),
+  total = c(100, 250, 175),
+  stringsAsFactors = FALSE
+)
+
+crm <- data.frame(
+  customer_id = c("C1", "C2", "C4"),
+  owner = c("Dana", "Eli", "Fay"),
+  stringsAsFactors = FALSE
+)
+
+join_spy(sales_reps, crm, by = c("id" = "customer_id"))
 
 ## -----------------------------------------------------------------------------
 invoices <- data.frame(
@@ -55,7 +74,7 @@ vendors <- data.frame(
   stringsAsFactors = FALSE
 )
 
-report <- join_spy(invoices, vendors, by = "company")
+join_spy(invoices, vendors, by = "company")
 
 ## -----------------------------------------------------------------------------
 # Simulate invisible character contamination
@@ -71,7 +90,33 @@ clean_ids <- data.frame(
   stringsAsFactors = FALSE
 )
 
-report <- join_spy(raw_ids, clean_ids, by = "product_id")
+join_spy(raw_ids, clean_ids, by = "product_id")
+
+## -----------------------------------------------------------------------------
+batches_x <- data.frame(
+  batch = c("LOT-A100", "LOT-B200", "LOT-C300"),
+  yield = c(0.92, 0.88, 0.95),
+  stringsAsFactors = FALSE
+)
+
+batches_y <- data.frame(
+  batch = c("LOT-A100", "LOT-B200", "LOT-C30O"),  # final character is a letter O
+  supplier = c("North", "East", "West"),
+  stringsAsFactors = FALSE
+)
+
+join_spy(batches_x, batches_y, by = "batch")
+
+## -----------------------------------------------------------------------------
+shipments <- data.frame(zip = c(1010, 1020, 1030), n_parcels = c(5, 7, 2))
+
+zones <- data.frame(
+  zip = c("1010", "1020", "1030"),
+  zone = c("Inner", "Mid", "Outer"),
+  stringsAsFactors = FALSE
+)
+
+join_spy(shipments, zones, by = "zip")
 
 ## -----------------------------------------------------------------------------
 employees <- data.frame(
@@ -86,7 +131,7 @@ departments <- data.frame(
   stringsAsFactors = FALSE
 )
 
-report <- join_spy(employees, departments, by = "dept")
+join_spy(employees, departments, by = "dept")
 
 ## -----------------------------------------------------------------------------
 transactions <- data.frame(
@@ -97,6 +142,33 @@ transactions <- data.frame(
 )
 
 key_duplicates(transactions, by = "store_id")
+
+## -----------------------------------------------------------------------------
+key_duplicates(transactions, by = "store_id", keep = "first")
+
+## -----------------------------------------------------------------------------
+report <- join_spy(sales, cities, by = "city")
+names(report)
+
+## -----------------------------------------------------------------------------
+report$match_analysis$match_rate
+report$match_analysis$left_only_keys
+
+## -----------------------------------------------------------------------------
+vapply(report$issues, function(i) i$type, character(1))
+report$issues[[1]]$message
+
+## -----------------------------------------------------------------------------
+summary(report)
+
+## -----------------------------------------------------------------------------
+summary(report, format = "markdown")
+
+## -----------------------------------------------------------------------------
+plot(report)
+
+## -----------------------------------------------------------------------------
+is_join_report(report)
 
 ## -----------------------------------------------------------------------------
 messy_left <- data.frame(
@@ -129,6 +201,15 @@ repaired$y$id
 key_check(repaired$x, repaired$y, by = "id")
 
 ## -----------------------------------------------------------------------------
+codes <- data.frame(
+  code = c(" X1", "X2 ", ""),
+  n = 1:3,
+  stringsAsFactors = FALSE
+)
+
+join_repair(codes, by = "code", empty_to_na = TRUE)
+
+## -----------------------------------------------------------------------------
 report <- join_spy(messy_left, messy_right, by = "id")
 suggest_repairs(report)
 
@@ -149,7 +230,24 @@ report <- join_spy(orders, products, by = "product_id")
 report$expected_rows
 
 ## -----------------------------------------------------------------------------
+report$memory_estimate
+
+## -----------------------------------------------------------------------------
 summary(report)
+
+## -----------------------------------------------------------------------------
+set.seed(7)
+big_orders <- data.frame(
+  product_id = sample(sprintf("P%04d", 1:5000), 20000, replace = TRUE),
+  qty = sample(1:10, 20000, replace = TRUE)
+)
+catalog <- data.frame(
+  product_id = sprintf("P%04d", 1:5000),
+  price = round(runif(5000, 1, 100), 2)
+)
+
+report_big <- join_spy(big_orders, catalog, by = "product_id", sample = 2000)
+report_big$sampling
 
 ## -----------------------------------------------------------------------------
 tickets <- data.frame(
@@ -165,7 +263,11 @@ events <- data.frame(
 )
 
 result <- merge(tickets, events, by = "event_id")
-join_explain(result, tickets, events, by = "event_id", type = "inner")
+expl <- join_explain(result, tickets, events, by = "event_id", type = "inner")
+
+## -----------------------------------------------------------------------------
+expl$diff
+expl$left_only
 
 ## -----------------------------------------------------------------------------
 before <- data.frame(
@@ -197,7 +299,10 @@ dup_lookup <- data.frame(
 )
 
 after2 <- merge(before2, dup_lookup, by = "id")
-join_diff(before2, after2, by = "id")
+d <- join_diff(before2, after2, by = "id")
+
+## -----------------------------------------------------------------------------
+d$columns_added
 
 ## -----------------------------------------------------------------------------
 patients <- data.frame(
@@ -214,6 +319,10 @@ labs <- data.frame(
 
 result <- left_join_spy(patients, labs, by = "patient_id")
 head(result)
+
+## -----------------------------------------------------------------------------
+rpt <- attr(result, "join_report")
+rpt$expected_rows$left
 
 ## -----------------------------------------------------------------------------
 result <- inner_join_spy(patients, labs, by = "patient_id", .quiet = TRUE)
@@ -251,6 +360,9 @@ join_strict(sensors, readings_dup, by = "sensor_id", expect = "1:1")
 })
 
 ## -----------------------------------------------------------------------------
+join_strict(sensors, readings_dup, by = "sensor_id", expect = "1:n")
+
+## -----------------------------------------------------------------------------
 detect_cardinality(sensors, readings_dup, by = "sensor_id")
 
 ## -----------------------------------------------------------------------------
@@ -266,28 +378,23 @@ right <- data.frame(
   stringsAsFactors = FALSE
 )
 
-check_cartesian(left, right, by = "group")
+cart <- check_cartesian(left, right, by = "group")
 
 ## -----------------------------------------------------------------------------
-orders <- data.frame(
-  order_id = 1:4,
-  customer_id = c(1, 2, 2, 3),
-  stringsAsFactors = FALSE
-)
+cart$expansion_factor
+cart$worst_keys
 
-customers <- data.frame(
-  customer_id = 1:3,
-  region_id = c(1, 1, 2),
-  stringsAsFactors = FALSE
-)
+## -----------------------------------------------------------------------------
+check_cartesian(left, right, by = "group", threshold = 1.5)
 
-regions <- data.frame(
-  region_id = 1:2,
-  name = c("North", "South"),
-  stringsAsFactors = FALSE
-)
+## -----------------------------------------------------------------------------
+orders <- data.frame(order_id = 1:4, customer_id = c(1, 2, 2, 3))
+customers <- data.frame(customer_id = 1:3, region_id = c(1, 1, 2))
+regions <- data.frame(region_id = 1:2, name = c("North", "South"),
+                      stringsAsFactors = FALSE)
 
-analyze_join_chain(
+## -----------------------------------------------------------------------------
+chain <- analyze_join_chain(
   tables = list(orders = orders, customers = customers, regions = regions),
   joins = list(
     list(left = "orders", right = "customers", by = "customer_id"),
@@ -295,10 +402,37 @@ analyze_join_chain(
   )
 )
 
+## -----------------------------------------------------------------------------
+chain[[2]]$report$match_analysis$match_rate
+
 ## ----eval = FALSE-------------------------------------------------------------
 # # Force dplyr backend even for plain data frames
 # left_join_spy(x, y, by = "id", backend = "dplyr")
 # 
 # # Force base R for tibbles
 # left_join_spy(x, y, by = "id", backend = "base")
+
+## -----------------------------------------------------------------------------
+report <- join_spy(patients, labs, by = "patient_id")
+tmp <- tempfile(fileext = ".log")
+log_report(report, tmp, timestamp = FALSE)
+cat(readLines(tmp)[1:8], sep = "\n")
+
+## -----------------------------------------------------------------------------
+tmp_json <- tempfile(fileext = ".json")
+log_report(report, tmp_json, timestamp = FALSE)
+cat(readLines(tmp_json)[1:8], sep = "\n")
+unlink(c(tmp, tmp_json))
+
+## -----------------------------------------------------------------------------
+log_path <- tempfile(fileext = ".log")
+set_log_file(log_path)
+identical(get_log_file(), log_path)
+
+## -----------------------------------------------------------------------------
+r1 <- inner_join_spy(patients, labs, by = "patient_id", .quiet = TRUE)
+r2 <- left_join_spy(patients, labs, by = "patient_id", .quiet = TRUE)
+set_log_file(NULL)
+length(readLines(log_path)) > 0
+unlink(log_path)
 

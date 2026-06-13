@@ -12,7 +12,7 @@
 
 <meta name="author" content="Gilles Colling" />
 
-<meta name="date" content="2026-06-12" />
+<meta name="date" content="2026-06-13" />
 
 <title>Why Your Keys Don’t Match</title>
 
@@ -341,7 +341,7 @@ code > span.er { color: #a61717; background-color: #e3d2d2; }
 
 <h1 class="title toc-ignore">Why Your Keys Don’t Match</h1>
 <h4 class="author">Gilles Colling</h4>
-<h4 class="date">2026-06-12</h4>
+<h4 class="date">2026-06-13</h4>
 
 
 
@@ -354,7 +354,235 @@ different at the byte level: a trailing space, a case mismatch, or a
 zero-width Unicode character that occupies no screen width.</p>
 <p>This vignette walks through five scenarios where joins fail for
 string-level reasons that resist casual inspection. The data is
-synthetic; the patterns come from real pipelines.</p>
+synthetic; the patterns come from real pipelines. The first two sections
+cover the mechanics: what R compares when it joins two key columns, and
+which checks <code>join_spy()</code> runs against them. The scenarios
+then put both to work.</p>
+<div id="what-a-join-actually-compares" class="section level2">
+<h2>What a Join Actually Compares</h2>
+<p>Every join reduces to the same primitive: for each key in one table,
+find the positions of equal keys in the other. <code>merge()</code>
+builds on <code>match()</code>; dplyr and data.table run their own join
+engines and apply the same standard of equality. Two character keys are
+equal when their byte sequences are equal, after R translates any
+declared encodings to a common representation. There is no trimming, no
+case folding, no Unicode normalization along the way. A single byte of
+difference makes two keys strangers.</p>
+<p><code>identical()</code> applies the same standard, which makes it a
+convenient way to test what a join will see:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a>a <span class="ot">&lt;-</span> <span class="st">&quot;CUST-1002&quot;</span></span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a>b <span class="ot">&lt;-</span> <span class="st">&quot;CUST-1002 &quot;</span></span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a><span class="fu">identical</span>(a, b)</span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a><span class="co">#&gt; [1] FALSE</span></span>
+<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a><span class="fu">c</span>(<span class="fu">nchar</span>(a), <span class="fu">nchar</span>(b))</span>
+<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a><span class="co">#&gt; [1]  9 10</span></span></code></pre></div>
+<p>The strings differ by one character, and <code>charToRaw()</code>
+shows which byte is responsible:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="fu">charToRaw</span>(b)</span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a><span class="co">#&gt;  [1] 43 55 53 54 2d 31 30 30 32 20</span></span></code></pre></div>
+<p>The final <code>20</code> is an ordinary space. This one happens to
+be easy to spot once printed as bytes. The characters behind longer
+debugging sessions render as nothing at all, or as something
+indistinguishable from a space. The non-breaking space is the classic
+example:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>space <span class="ot">&lt;-</span> <span class="st">&quot;\u0020&quot;</span></span>
+<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>nbsp <span class="ot">&lt;-</span> <span class="st">&quot;\u00A0&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>space <span class="sc">==</span> nbsp</span>
+<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a><span class="co">#&gt; [1] FALSE</span></span>
+<span id="cb3-5"><a href="#cb3-5" tabindex="-1"></a><span class="fu">c</span>(<span class="fu">utf8ToInt</span>(space), <span class="fu">utf8ToInt</span>(nbsp))</span>
+<span id="cb3-6"><a href="#cb3-6" tabindex="-1"></a><span class="co">#&gt; [1]  32 160</span></span></code></pre></div>
+<p><code>utf8ToInt()</code> returns the Unicode code point of each
+character, which makes it the most direct inspection tool for a
+suspicious key: 32 is the space on your keyboard, 160 is the
+non-breaking space from a web page or a PDF. Both render as a gap of the
+same width.</p>
+<p>Two strings can also be visually identical with no invisible
+characters anywhere in them. Unicode allows an accented letter to be
+written two ways: as one precomposed code point, or as a base letter
+followed by a combining accent.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>e_one <span class="ot">&lt;-</span> <span class="st">&quot;\u00E9&quot;</span></span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>e_two <span class="ot">&lt;-</span> <span class="st">&quot;e\u0301&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a>e_one</span>
+<span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;é&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" tabindex="-1"></a>e_two</span>
+<span id="cb4-6"><a href="#cb4-6" tabindex="-1"></a><span class="co">#&gt; [1] &quot;é&quot;</span></span>
+<span id="cb4-7"><a href="#cb4-7" tabindex="-1"></a>e_one <span class="sc">==</span> e_two</span>
+<span id="cb4-8"><a href="#cb4-8" tabindex="-1"></a><span class="co">#&gt; [1] FALSE</span></span></code></pre></div>
+<p>Both print as the same accented e. The first is a single code point,
+the second is two, and R compares the sequences without normalizing
+them:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a><span class="fu">c</span>(<span class="fu">nchar</span>(e_one), <span class="fu">nchar</span>(e_two))</span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a><span class="co">#&gt; [1] 1 2</span></span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a><span class="fu">utf8ToInt</span>(e_one)</span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a><span class="co">#&gt; [1] 233</span></span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a><span class="fu">utf8ToInt</span>(e_two)</span>
+<span id="cb5-6"><a href="#cb5-6" tabindex="-1"></a><span class="co">#&gt; [1] 101 769</span></span></code></pre></div>
+<p>A reference table typed by hand usually carries the precomposed form.
+Data that passed through certain text processors or through macOS file
+paths can arrive decomposed, and a column of city or person names will
+then fail to match a column that looks identical character for
+character.</p>
+<p>Encoding adds one more layer. The same character can be stored as
+different bytes depending on the encoding. The umlauted u is one byte in
+latin1 and two bytes in UTF-8:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>city_utf8 <span class="ot">&lt;-</span> <span class="st">&quot;Z\u00FCrich&quot;</span></span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>city_latin1 <span class="ot">&lt;-</span> <span class="fu">iconv</span>(city_utf8, <span class="at">from =</span> <span class="st">&quot;UTF-8&quot;</span>, <span class="at">to =</span> <span class="st">&quot;latin1&quot;</span>)</span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a><span class="fu">c</span>(<span class="fu">Encoding</span>(city_utf8), <span class="fu">Encoding</span>(city_latin1))</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;UTF-8&quot;  &quot;latin1&quot;</span></span>
+<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a><span class="fu">charToRaw</span>(city_utf8)</span>
+<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a><span class="co">#&gt; [1] 5a c3 bc 72 69 63 68</span></span>
+<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a><span class="fu">charToRaw</span>(city_latin1)</span>
+<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a><span class="co">#&gt; [1] 5a fc 72 69 63 68</span></span></code></pre></div>
+<p>Different bytes, same declared meaning. As long as the declaration is
+correct, R translates before comparing and the keys still match:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>city_utf8 <span class="sc">==</span> city_latin1</span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span></code></pre></div>
+<p>Trouble starts when bytes and declaration disagree. A latin1 file
+read as if it were UTF-8, or read with no declaration on a system that
+assumes one, produces strings whose bytes no longer mean what R thinks
+they mean. Accented keys then differ from their clean counterparts, and
+nothing in the comparison machinery reconciles them.
+<code>join_spy()</code> flags key columns that mix declared encodings,
+since mixed declarations within a single column usually mean some values
+entered the session by a different route than the rest.</p>
+<p>None of the failures above produce a warning, because none of them
+are errors from R’s point of view. String equality is exact and well
+defined. A join that matches three keys out of six did what it was told,
+and a zero-row inner join is a legitimate result (an anti-join hopes for
+exactly that). <code>merge()</code> has no way to know that six matches
+were expected. The evidence that something went wrong lives in the
+difference between the rows you expected and the rows you got, which is
+why diagnosing it takes a separate step.</p>
+</div>
+<div id="what-join_spy-scans-for" class="section level2">
+<h2>What join_spy() Scans For</h2>
+<p>Every scenario below ends with a <code>join_spy()</code> call, so it
+is worth laying out what that call checks. Everything happens inside the
+one function and comes back in the printed <code>JoinReport</code>. The
+chunks in this section reproduce individual checks with base R so the
+mechanics are visible; none of them are needed in normal use.</p>
+<div id="whitespace" class="section level3">
+<h3>Whitespace</h3>
+<p>Leading and trailing whitespace is detected with anchored regular
+expressions over each character key column:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>ids <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">&quot;CUST-1001&quot;</span>, <span class="st">&quot;CUST-1002 &quot;</span>, <span class="st">&quot; CUST-1004&quot;</span>)</span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a><span class="fu">grepl</span>(<span class="st">&quot;^</span><span class="sc">\\</span><span class="st">s+&quot;</span>, ids)</span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a><span class="co">#&gt; [1] FALSE FALSE  TRUE</span></span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="fu">grepl</span>(<span class="st">&quot;</span><span class="sc">\\</span><span class="st">s+$&quot;</span>, ids)</span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a><span class="co">#&gt; [1] FALSE  TRUE FALSE</span></span></code></pre></div>
+<p>Values failing either test are collected and reported with their
+column and table. Interior whitespace is left alone:
+<code>&quot;New York&quot;</code> and <code>&quot;New  York&quot;</code> differ by an
+interior space and fall to the near-match check further down.</p>
+</div>
+<div id="case" class="section level3">
+<h3>Case</h3>
+<p>A case mismatch is defined relationally. A key counts only when it
+has no exact match in the other table and would gain one if both sides
+were lowercased:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>crm <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">&quot;ALICE@ACME.COM&quot;</span>, <span class="st">&quot;EVE@ACME.COM&quot;</span>)</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>clicks <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">&quot;alice@acme.com&quot;</span>, <span class="st">&quot;frank@acme.com&quot;</span>)</span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>crm[<span class="fu">tolower</span>(crm) <span class="sc">%in%</span> <span class="fu">tolower</span>(clicks)]</span>
+<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;ALICE@ACME.COM&quot;</span></span></code></pre></div>
+<p>Eve appears in neither form on the right, so she is a genuinely
+unmatched key; Alice is a case mismatch. The report keeps example pairs,
+which is how the output in Scenario 2 can name the specific addresses
+involved.</p>
+</div>
+<div id="invisible-characters-and-encodings" class="section level3">
+<h3>Invisible characters and encodings</h3>
+<p>The encoding check looks for two conditions: mixed declared encodings
+within one column, read off <code>Encoding()</code>, and the presence of
+any of five code points that render as nothing or as an ordinary-looking
+space:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>hidden <span class="ot">&lt;-</span> <span class="st">&quot;[\u200B\u200C\u200D\uFEFF\u00A0]&quot;</span></span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a><span class="fu">grepl</span>(hidden, <span class="fu">c</span>(<span class="st">&quot;India\u200B&quot;</span>, <span class="st">&quot;India&quot;</span>), <span class="at">perl =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a><span class="co">#&gt; [1]  TRUE FALSE</span></span></code></pre></div>
+<p>The watch list is U+200B (zero-width space), U+200C (zero-width
+non-joiner), U+200D (zero-width joiner), U+FEFF (byte order mark), and
+U+00A0 (non-breaking space). U+00A0 earns its place on the list because
+regex whitespace classes and <code>trimws()</code> treat it
+inconsistently across engines and locales, so a whitespace scan alone
+cannot be trusted to catch it.</p>
+</div>
+<div id="empty-strings" class="section level3">
+<h3>Empty strings</h3>
+<p>Empty strings sit in a blind spot: they read as missing data to a
+human and as a valid key to a join.</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a><span class="fu">c</span>(<span class="st">&quot;&quot;</span> <span class="sc">==</span> <span class="st">&quot;&quot;</span>, <span class="st">&quot;&quot;</span> <span class="sc">==</span> <span class="cn">NA</span>)</span>
+<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a><span class="co">#&gt; [1] TRUE   NA</span></span></code></pre></div>
+<p>An empty string equals another empty string, so two tables that both
+use <code>&quot;&quot;</code> as a placeholder will match those rows to each
+other. The report flags empty keys as informational, and
+<code>join_repair(empty_to_na = TRUE)</code> converts them when that
+match behavior is unwanted.</p>
+</div>
+<div id="types-factors-and-numeric-keys" class="section level3">
+<h3>Types, factors, and numeric keys</h3>
+<p>Key columns can also be factors, integers, or doubles, and the type
+checks cover the seams between column types. Character against factor is
+reported as informational, since the join will coerce. Character against
+numeric is reported as a warning, because that coercion is a recurring
+source of surprises. When both sides are factors, their level sets are
+compared and any levels unique to one side are listed. Numeric keys get
+two checks of their own: keys with decimal parts, and keys large enough
+to exhaust double precision.</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a><span class="fl">0.1</span> <span class="sc">+</span> <span class="fl">0.2</span> <span class="sc">==</span> <span class="fl">0.3</span></span>
+<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a><span class="co">#&gt; [1] FALSE</span></span>
+<span id="cb12-3"><a href="#cb12-3" tabindex="-1"></a><span class="dv">2</span><span class="sc">^</span><span class="dv">53</span> <span class="sc">==</span> <span class="dv">2</span><span class="sc">^</span><span class="dv">53</span> <span class="sc">+</span> <span class="dv">1</span></span>
+<span id="cb12-4"><a href="#cb12-4" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span></code></pre></div>
+<p>Both lines are standard floating-point behavior, and both translate
+directly into joins that quietly drop or merge rows: a key computed as
+<code>0.1 + 0.2</code> will never find a key stored as <code>0.3</code>,
+and above <code>2^53</code> distinct integer IDs stop being
+distinguishable as doubles.</p>
+</div>
+<div id="duplicates-nas-and-predicted-row-counts" class="section level3">
+<h3>Duplicates, NAs, and predicted row counts</h3>
+<p>Separately from string quality, <code>join_spy()</code> summarizes
+each table’s keys: rows, unique keys, duplicated keys, NA keys.
+Duplicates matter because each match against a duplicated key multiplies
+rows; NA keys matter because they will not match. From the per-key
+counts the report predicts the result size of all four join types. The
+inner-join figure is the sum, over matched keys, of the product of each
+side’s counts, which is exactly the arithmetic that turns a
+harmless-looking duplicate into a memory problem. The report object also
+carries a heuristic memory estimate per join type for the same
+reason.</p>
+</div>
+<div id="near-matches" class="section level3">
+<h3>Near matches</h3>
+<p>Whatever remains unmatched after the exact analysis goes through a
+typo hunt. Unmatched left keys are compared against right keys by
+Levenshtein edit distance, the minimum number of single-character
+insertions, deletions, and substitutions needed to turn one string into
+the other, computed with <code>utils::adist()</code>:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a>utils<span class="sc">::</span><span class="fu">adist</span>(<span class="st">&quot;WDG102&quot;</span>, <span class="st">&quot;WDG-102&quot;</span>)</span>
+<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a><span class="co">#&gt;      [,1]</span></span>
+<span id="cb13-3"><a href="#cb13-3" tabindex="-1"></a><span class="co">#&gt; [1,]    1</span></span>
+<span id="cb13-4"><a href="#cb13-4" tabindex="-1"></a>utils<span class="sc">::</span><span class="fu">adist</span>(<span class="st">&quot;Asia Pacific &quot;</span>, <span class="st">&quot;Asia Pacific&quot;</span>)</span>
+<span id="cb13-5"><a href="#cb13-5" tabindex="-1"></a><span class="co">#&gt;      [,1]</span></span>
+<span id="cb13-6"><a href="#cb13-6" tabindex="-1"></a><span class="co">#&gt; [1,]    1</span></span></code></pre></div>
+<p>A pair is reported as a near match when its distance is 1 or 2. Keys
+shorter than three characters are skipped, since nearly everything sits
+within two edits of a string like <code>&quot;A7&quot;</code>. A length pre-check
+discards pairs whose lengths already differ by more than two, and to
+keep the scan cheap the comparison covers at most 50 unmatched left keys
+against 100 right keys, reporting the 10 closest pairs. Near matches
+stay informational: <code>&quot;WDG102&quot;</code> sitting one edit from
+<code>&quot;WDG-102&quot;</code> is strong evidence of a typo, and the report
+points it out without changing anything.</p>
+</div>
+<div id="compound-keys" class="section level3">
+<h3>Compound keys</h3>
+<p>For multi-column keys, an extra pass analyzes each key column on its
+own: unique values per side, matches between them, and a per-column
+match rate. The column with the lowest match rate is called out as the
+likely problem column. Scenario 5 shows what this buys: an overall match
+rate says something is wrong, and the per-column breakdown says
+where.</p>
+</div>
+</div>
 <div id="scenario-1-the-excel-export" class="section level2">
 <h2>Scenario 1: The Excel Export</h2>
 <p>A retail analytics team receives monthly sales data from a
@@ -364,43 +592,81 @@ quarters, everything works. Then one month, 30% of the sales records
 stop matching. Nobody changed the code or the customer database. The
 partner’s IDs are all present in the internal system – or so it
 appears.</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a>partner_sales <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;CUST-1001&quot;</span>, <span class="st">&quot;CUST-1002 &quot;</span>, <span class="st">&quot;CUST-1003&quot;</span>,</span>
-<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a>                  <span class="st">&quot; CUST-1004&quot;</span>, <span class="st">&quot;CUST-1005 &quot;</span>, <span class="st">&quot;CUST-1006&quot;</span>),</span>
-<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">2500</span>, <span class="dv">1800</span>, <span class="dv">3200</span>, <span class="dv">950</span>, <span class="dv">4100</span>, <span class="dv">1600</span>),</span>
-<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a>)</span>
-<span id="cb1-7"><a href="#cb1-7" tabindex="-1"></a></span>
-<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a>internal_db <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;CUST-1001&quot;</span>, <span class="st">&quot;CUST-1002&quot;</span>, <span class="st">&quot;CUST-1003&quot;</span>,</span>
-<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a>                  <span class="st">&quot;CUST-1004&quot;</span>, <span class="st">&quot;CUST-1005&quot;</span>, <span class="st">&quot;CUST-1006&quot;</span>, <span class="st">&quot;CUST-1007&quot;</span>),</span>
-<span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">c</span>(<span class="st">&quot;West&quot;</span>, <span class="st">&quot;East&quot;</span>, <span class="st">&quot;West&quot;</span>, <span class="st">&quot;South&quot;</span>, <span class="st">&quot;East&quot;</span>, <span class="st">&quot;North&quot;</span>, <span class="st">&quot;West&quot;</span>),</span>
-<span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a>partner_sales <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb14-2"><a href="#cb14-2" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;CUST-1001&quot;</span>, <span class="st">&quot;CUST-1002 &quot;</span>, <span class="st">&quot;CUST-1003&quot;</span>,</span>
+<span id="cb14-3"><a href="#cb14-3" tabindex="-1"></a>                  <span class="st">&quot; CUST-1004&quot;</span>, <span class="st">&quot;CUST-1005 &quot;</span>, <span class="st">&quot;CUST-1006&quot;</span>),</span>
+<span id="cb14-4"><a href="#cb14-4" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">2500</span>, <span class="dv">1800</span>, <span class="dv">3200</span>, <span class="dv">950</span>, <span class="dv">4100</span>, <span class="dv">1600</span>),</span>
+<span id="cb14-5"><a href="#cb14-5" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb14-6"><a href="#cb14-6" tabindex="-1"></a>)</span>
+<span id="cb14-7"><a href="#cb14-7" tabindex="-1"></a></span>
+<span id="cb14-8"><a href="#cb14-8" tabindex="-1"></a>internal_db <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb14-9"><a href="#cb14-9" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;CUST-1001&quot;</span>, <span class="st">&quot;CUST-1002&quot;</span>, <span class="st">&quot;CUST-1003&quot;</span>,</span>
+<span id="cb14-10"><a href="#cb14-10" tabindex="-1"></a>                  <span class="st">&quot;CUST-1004&quot;</span>, <span class="st">&quot;CUST-1005&quot;</span>, <span class="st">&quot;CUST-1006&quot;</span>, <span class="st">&quot;CUST-1007&quot;</span>),</span>
+<span id="cb14-11"><a href="#cb14-11" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">c</span>(<span class="st">&quot;West&quot;</span>, <span class="st">&quot;East&quot;</span>, <span class="st">&quot;West&quot;</span>, <span class="st">&quot;South&quot;</span>, <span class="st">&quot;East&quot;</span>, <span class="st">&quot;North&quot;</span>, <span class="st">&quot;West&quot;</span>),</span>
+<span id="cb14-12"><a href="#cb14-12" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb14-13"><a href="#cb14-13" tabindex="-1"></a>)</span></code></pre></div>
 <p>Nothing in <code>str()</code> or <code>print()</code> reveals the
 issue – trailing spaces are invisible in console output.
 <code>join_spy()</code> catches it:</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(partner_sales, internal_db, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(partner_sales, internal_db, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a>report</span>
+<span id="cb15-3"><a href="#cb15-3" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-4"><a href="#cb15-4" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb15-5"><a href="#cb15-5" tabindex="-1"></a><span class="co">#&gt; Join columns: customer_id</span></span>
+<span id="cb15-6"><a href="#cb15-6" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-7"><a href="#cb15-7" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb15-8"><a href="#cb15-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-9"><a href="#cb15-9" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 6 Unique keys: 6 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb15-10"><a href="#cb15-10" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 7 Unique keys: 7 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb15-11"><a href="#cb15-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-12"><a href="#cb15-12" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb15-13"><a href="#cb15-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-14"><a href="#cb15-14" tabindex="-1"></a><span class="co">#&gt; Keys in both: 3</span></span>
+<span id="cb15-15"><a href="#cb15-15" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 3</span></span>
+<span id="cb15-16"><a href="#cb15-16" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 4</span></span>
+<span id="cb15-17"><a href="#cb15-17" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;50%&quot;</span></span>
+<span id="cb15-18"><a href="#cb15-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-19"><a href="#cb15-19" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb15-20"><a href="#cb15-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-21"><a href="#cb15-21" tabindex="-1"></a><span class="co">#&gt; ! Left column &#39;customer_id&#39; has 3 value(s) with leading/trailing whitespace</span></span>
+<span id="cb15-22"><a href="#cb15-22" tabindex="-1"></a><span class="co">#&gt; ℹ 10 near-match(es) found (e.g., &#39;CUST-1002 &#39; ~ &#39;CUST-1002&#39;, &#39; CUST-1004&#39; ~ &#39;CUST-1004&#39;, &#39;CUST-1002 &#39; ~ &#39;CUST-1001&#39;) - possible typos?</span></span>
+<span id="cb15-23"><a href="#cb15-23" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-24"><a href="#cb15-24" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb15-25"><a href="#cb15-25" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb15-26"><a href="#cb15-26" tabindex="-1"></a><span class="co">#&gt; inner_join: 3</span></span>
+<span id="cb15-27"><a href="#cb15-27" tabindex="-1"></a><span class="co">#&gt; left_join: 6</span></span>
+<span id="cb15-28"><a href="#cb15-28" tabindex="-1"></a><span class="co">#&gt; right_join: 7</span></span>
+<span id="cb15-29"><a href="#cb15-29" tabindex="-1"></a><span class="co">#&gt; full_join: 10</span></span></code></pre></div>
 <p>Three of the six partner IDs carry whitespace.
 <code>&quot;CUST-1002 &quot;</code> is a different string from
 <code>&quot;CUST-1002&quot;</code> as far as R is concerned.
 <code>join_repair()</code> trims both tables at once:</p>
-<div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(partner_sales, internal_db, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
-<span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 3 value(s)</span></span>
-<span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>partner_fixed <span class="ot">&lt;-</span> repaired<span class="sc">$</span>x</span>
-<span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>internal_fixed <span class="ot">&lt;-</span> repaired<span class="sc">$</span>y</span></code></pre></div>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(partner_sales, internal_db, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb16-2"><a href="#cb16-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 3 value(s)</span></span>
+<span id="cb16-3"><a href="#cb16-3" tabindex="-1"></a>partner_fixed <span class="ot">&lt;-</span> repaired<span class="sc">$</span>x</span>
+<span id="cb16-4"><a href="#cb16-4" tabindex="-1"></a>internal_fixed <span class="ot">&lt;-</span> repaired<span class="sc">$</span>y</span></code></pre></div>
 <p>We can verify the repair worked:</p>
-<div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a><span class="fu">key_check</span>(partner_fixed, internal_fixed, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
-<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a><span class="co">#&gt; ✔ Key check passed: no issues detected</span></span></code></pre></div>
+<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a><span class="fu">key_check</span>(partner_fixed, internal_fixed, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb17-2"><a href="#cb17-2" tabindex="-1"></a><span class="co">#&gt; ✔ Key check passed: no issues detected</span></span></code></pre></div>
 <p>And now the join gives us what we expected:</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(partner_fixed, internal_fixed, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
-<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
-<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
+<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(partner_fixed, internal_fixed, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb18-2"><a href="#cb18-2" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
+<span id="cb18-3"><a href="#cb18-3" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
 <p>The root cause was an Excel <code>CONCATENATE</code> formula that
 preserved trailing spaces from a variable-width source column. Excel
 renders <code>&quot;CUST-1002&quot;</code> and <code>&quot;CUST-1002 &quot;</code>
 identically, so nobody noticed. Trailing whitespace is the single most
 common join failure we see in practice.</p>
+<p>Excel is one of several routes for this defect. SQL
+<code>CHAR(n)</code> columns pad values with spaces to a fixed width,
+and some database drivers deliver the padding to R intact. Fixed-width
+flat files do it by construction. Manual entry adds a trailing space
+whenever someone types one before tabbing out of a cell. Every route
+passes through an ingestion point, so the cheapest prevention is to trim
+key columns once, where external data enters the pipeline, and to put a
+<code>key_check()</code> call at that boundary. It would have turned
+this quarter’s silent 30% match drop into a loud failure on the first
+run.</p>
 </div>
 <div id="scenario-2-two-databases-two-conventions" class="section level2">
 <h2>Scenario 2: Two Databases, Two Conventions</h2>
@@ -408,54 +674,91 @@ common join failure we see in practice.</p>
 churn analysis. The CRM stores email addresses in uppercase (a database
 migration decision from the late 1990s). The web app stores them in
 lowercase. Both systems are internally consistent.</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>crm_profiles <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>  <span class="at">email =</span> <span class="fu">c</span>(<span class="st">&quot;ALICE@ACME.COM&quot;</span>, <span class="st">&quot;BOB@ACME.COM&quot;</span>, <span class="st">&quot;CAROL@ACME.COM&quot;</span>,</span>
-<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>            <span class="st">&quot;DAVE@ACME.COM&quot;</span>, <span class="st">&quot;EVE@ACME.COM&quot;</span>),</span>
-<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a>  <span class="at">plan =</span> <span class="fu">c</span>(<span class="st">&quot;enterprise&quot;</span>, <span class="st">&quot;starter&quot;</span>, <span class="st">&quot;pro&quot;</span>, <span class="st">&quot;enterprise&quot;</span>, <span class="st">&quot;starter&quot;</span>),</span>
-<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a>)</span>
-<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a></span>
-<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a>click_events <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb6-9"><a href="#cb6-9" tabindex="-1"></a>  <span class="at">email =</span> <span class="fu">c</span>(<span class="st">&quot;alice@acme.com&quot;</span>, <span class="st">&quot;bob@acme.com&quot;</span>, <span class="st">&quot;carol@acme.com&quot;</span>,</span>
-<span id="cb6-10"><a href="#cb6-10" tabindex="-1"></a>            <span class="st">&quot;dave@acme.com&quot;</span>, <span class="st">&quot;frank@acme.com&quot;</span>),</span>
-<span id="cb6-11"><a href="#cb6-11" tabindex="-1"></a>  <span class="at">page_views =</span> <span class="fu">c</span>(<span class="dv">47</span>, <span class="dv">12</span>, <span class="dv">89</span>, <span class="dv">33</span>, <span class="dv">5</span>),</span>
-<span id="cb6-12"><a href="#cb6-12" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb6-13"><a href="#cb6-13" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a>crm_profiles <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a>  <span class="at">email =</span> <span class="fu">c</span>(<span class="st">&quot;ALICE@ACME.COM&quot;</span>, <span class="st">&quot;BOB@ACME.COM&quot;</span>, <span class="st">&quot;CAROL@ACME.COM&quot;</span>,</span>
+<span id="cb19-3"><a href="#cb19-3" tabindex="-1"></a>            <span class="st">&quot;DAVE@ACME.COM&quot;</span>, <span class="st">&quot;EVE@ACME.COM&quot;</span>),</span>
+<span id="cb19-4"><a href="#cb19-4" tabindex="-1"></a>  <span class="at">plan =</span> <span class="fu">c</span>(<span class="st">&quot;enterprise&quot;</span>, <span class="st">&quot;starter&quot;</span>, <span class="st">&quot;pro&quot;</span>, <span class="st">&quot;enterprise&quot;</span>, <span class="st">&quot;starter&quot;</span>),</span>
+<span id="cb19-5"><a href="#cb19-5" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb19-6"><a href="#cb19-6" tabindex="-1"></a>)</span>
+<span id="cb19-7"><a href="#cb19-7" tabindex="-1"></a></span>
+<span id="cb19-8"><a href="#cb19-8" tabindex="-1"></a>click_events <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb19-9"><a href="#cb19-9" tabindex="-1"></a>  <span class="at">email =</span> <span class="fu">c</span>(<span class="st">&quot;alice@acme.com&quot;</span>, <span class="st">&quot;bob@acme.com&quot;</span>, <span class="st">&quot;carol@acme.com&quot;</span>,</span>
+<span id="cb19-10"><a href="#cb19-10" tabindex="-1"></a>            <span class="st">&quot;dave@acme.com&quot;</span>, <span class="st">&quot;frank@acme.com&quot;</span>),</span>
+<span id="cb19-11"><a href="#cb19-11" tabindex="-1"></a>  <span class="at">page_views =</span> <span class="fu">c</span>(<span class="dv">47</span>, <span class="dv">12</span>, <span class="dv">89</span>, <span class="dv">33</span>, <span class="dv">5</span>),</span>
+<span id="cb19-12"><a href="#cb19-12" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb19-13"><a href="#cb19-13" tabindex="-1"></a>)</span></code></pre></div>
 <p>An inner join returns zero rows. R’s string comparison is
 case-sensitive, so every key pair fails. <code>join_spy()</code> flags
 the situation before the join:</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(crm_profiles, click_events, <span class="at">by =</span> <span class="st">&quot;email&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(crm_profiles, click_events, <span class="at">by =</span> <span class="st">&quot;email&quot;</span>)</span>
+<span id="cb20-2"><a href="#cb20-2" tabindex="-1"></a>report</span>
+<span id="cb20-3"><a href="#cb20-3" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-4"><a href="#cb20-4" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb20-5"><a href="#cb20-5" tabindex="-1"></a><span class="co">#&gt; Join columns: email</span></span>
+<span id="cb20-6"><a href="#cb20-6" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-7"><a href="#cb20-7" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb20-8"><a href="#cb20-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-9"><a href="#cb20-9" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 5 Unique keys: 5 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb20-10"><a href="#cb20-10" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 5 Unique keys: 5 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb20-11"><a href="#cb20-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-12"><a href="#cb20-12" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb20-13"><a href="#cb20-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-14"><a href="#cb20-14" tabindex="-1"></a><span class="co">#&gt; Keys in both: 0</span></span>
+<span id="cb20-15"><a href="#cb20-15" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 5</span></span>
+<span id="cb20-16"><a href="#cb20-16" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 5</span></span>
+<span id="cb20-17"><a href="#cb20-17" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;0%&quot;</span></span>
+<span id="cb20-18"><a href="#cb20-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-19"><a href="#cb20-19" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb20-20"><a href="#cb20-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-21"><a href="#cb20-21" tabindex="-1"></a><span class="co">#&gt; ! 4 key(s) would match if case-insensitive (e.g., &#39;ALICE@ACME.COM&#39; vs &#39;alice@acme.com&#39;)</span></span>
+<span id="cb20-22"><a href="#cb20-22" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-23"><a href="#cb20-23" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb20-24"><a href="#cb20-24" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb20-25"><a href="#cb20-25" tabindex="-1"></a><span class="co">#&gt; inner_join: 0</span></span>
+<span id="cb20-26"><a href="#cb20-26" tabindex="-1"></a><span class="co">#&gt; left_join: 5</span></span>
+<span id="cb20-27"><a href="#cb20-27" tabindex="-1"></a><span class="co">#&gt; right_join: 5</span></span>
+<span id="cb20-28"><a href="#cb20-28" tabindex="-1"></a><span class="co">#&gt; full_join: 10</span></span></code></pre></div>
 <p><code>suggest_repairs()</code> generates the fix:</p>
-<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a><span class="fu">suggest_repairs</span>(report)</span>
-<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a><span class="co">#&gt; ── Suggested Repairs ───────────────────────────────────────────────────────────</span></span>
-<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="co">#&gt; # Standardize case:</span></span>
-<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a><span class="co">#&gt; x[[&quot;email&quot;]] &lt;- tolower(x[[&quot;email&quot;]])</span></span>
-<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a><span class="co">#&gt; y[[&quot;email&quot;]] &lt;- tolower(y[[&quot;email&quot;]])</span></span></code></pre></div>
+<div class="sourceCode" id="cb21"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" tabindex="-1"></a><span class="fu">suggest_repairs</span>(report)</span>
+<span id="cb21-2"><a href="#cb21-2" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb21-3"><a href="#cb21-3" tabindex="-1"></a><span class="co">#&gt; ── Suggested Repairs ───────────────────────────────────────────────────────────</span></span>
+<span id="cb21-4"><a href="#cb21-4" tabindex="-1"></a><span class="co">#&gt; # Standardize case:</span></span>
+<span id="cb21-5"><a href="#cb21-5" tabindex="-1"></a><span class="co">#&gt; x[[&quot;email&quot;]] &lt;- tolower(x[[&quot;email&quot;]])</span></span>
+<span id="cb21-6"><a href="#cb21-6" tabindex="-1"></a><span class="co">#&gt; y[[&quot;email&quot;]] &lt;- tolower(y[[&quot;email&quot;]])</span></span></code></pre></div>
 <p>Or we can use <code>join_repair()</code> directly, specifying case
 standardization:</p>
-<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(</span>
-<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>  crm_profiles, click_events,</span>
-<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>  <span class="at">by =</span> <span class="st">&quot;email&quot;</span>,</span>
-<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>  <span class="at">standardize_case =</span> <span class="st">&quot;lower&quot;</span></span>
-<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a>)</span>
-<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 5 value(s)</span></span></code></pre></div>
+<div class="sourceCode" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(</span>
+<span id="cb22-2"><a href="#cb22-2" tabindex="-1"></a>  crm_profiles, click_events,</span>
+<span id="cb22-3"><a href="#cb22-3" tabindex="-1"></a>  <span class="at">by =</span> <span class="st">&quot;email&quot;</span>,</span>
+<span id="cb22-4"><a href="#cb22-4" tabindex="-1"></a>  <span class="at">standardize_case =</span> <span class="st">&quot;lower&quot;</span></span>
+<span id="cb22-5"><a href="#cb22-5" tabindex="-1"></a>)</span>
+<span id="cb22-6"><a href="#cb22-6" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 5 value(s)</span></span></code></pre></div>
 <p>After lowercasing both sides, the inner join returns four matched
 rows (everyone except Eve, who has no click data, and Frank, who is not
 in the CRM):</p>
-<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;email&quot;</span>)</span>
-<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
-<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span>
-<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a>result</span>
-<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a><span class="co">#&gt;            email       plan page_views</span></span>
-<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a><span class="co">#&gt; 1 alice@acme.com enterprise         47</span></span>
-<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a><span class="co">#&gt; 2   bob@acme.com    starter         12</span></span>
-<span id="cb10-8"><a href="#cb10-8" tabindex="-1"></a><span class="co">#&gt; 3 carol@acme.com        pro         89</span></span>
-<span id="cb10-9"><a href="#cb10-9" tabindex="-1"></a><span class="co">#&gt; 4  dave@acme.com enterprise         33</span></span></code></pre></div>
+<div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;email&quot;</span>)</span>
+<span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
+<span id="cb23-3"><a href="#cb23-3" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span>
+<span id="cb23-4"><a href="#cb23-4" tabindex="-1"></a>result</span>
+<span id="cb23-5"><a href="#cb23-5" tabindex="-1"></a><span class="co">#&gt;            email       plan page_views</span></span>
+<span id="cb23-6"><a href="#cb23-6" tabindex="-1"></a><span class="co">#&gt; 1 alice@acme.com enterprise         47</span></span>
+<span id="cb23-7"><a href="#cb23-7" tabindex="-1"></a><span class="co">#&gt; 2   bob@acme.com    starter         12</span></span>
+<span id="cb23-8"><a href="#cb23-8" tabindex="-1"></a><span class="co">#&gt; 3 carol@acme.com        pro         89</span></span>
+<span id="cb23-9"><a href="#cb23-9" tabindex="-1"></a><span class="co">#&gt; 4  dave@acme.com enterprise         33</span></span></code></pre></div>
 <p>Email addresses are case-insensitive by RFC 5321, so lowercasing is
 the right normalization here. For other identifier types (product codes,
 country abbreviations), <code>&quot;upper&quot;</code> may be more
 appropriate.</p>
+<p>Conventions like these are system-wide and invisible from inside the
+system that holds them. Many database collations compare strings
+case-insensitively, so the CRM’s uppercase migration never broke an
+internal query; the web stack lowercased on write and was just as
+self-consistent. The mismatch exists only at the seam where the two
+systems meet, which is where an R join usually sits. The first join
+between two new sources is the right moment to run
+<code>join_spy()</code> and settle the convention question, and spelling
+the choice out through <code>standardize_case</code> documents it in
+code for the next person who touches the pipeline.</p>
 </div>
 <div id="scenario-3-the-pdf-copy-paste" class="section level2">
 <h2>Scenario 3: The PDF Copy-Paste</h2>
@@ -465,42 +768,85 @@ PDF, so she copies the table from the PDF viewer, pastes into a
 spreadsheet, cleans up the columns, and reads the CSV into R. The data
 looks perfect – every country name is spelled correctly. But half the
 countries fail to match a reference population table.</p>
-<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a><span class="co"># Simulating PDF copy-paste artifacts:</span></span>
-<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a><span class="co"># \u00A0 is non-breaking space, \u200B is zero-width space</span></span>
-<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>pdf_data <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>  <span class="at">country =</span> <span class="fu">c</span>(<span class="st">&quot;Brazil&quot;</span>, <span class="st">&quot;India\u200B&quot;</span>, <span class="st">&quot;Germany&quot;</span>,</span>
-<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a>              <span class="st">&quot;Japan\u00A0&quot;</span>, <span class="st">&quot;Canada&quot;</span>, <span class="st">&quot;France\u200B&quot;</span>),</span>
-<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a>  <span class="at">prevalence =</span> <span class="fu">c</span>(<span class="fl">12.3</span>, <span class="fl">8.7</span>, <span class="fl">5.1</span>, <span class="fl">3.9</span>, <span class="fl">6.2</span>, <span class="fl">4.8</span>),</span>
-<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb11-8"><a href="#cb11-8" tabindex="-1"></a>)</span>
-<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a></span>
-<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a>reference <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb11-11"><a href="#cb11-11" tabindex="-1"></a>  <span class="at">country =</span> <span class="fu">c</span>(<span class="st">&quot;Brazil&quot;</span>, <span class="st">&quot;India&quot;</span>, <span class="st">&quot;Germany&quot;</span>, <span class="st">&quot;Japan&quot;</span>,</span>
-<span id="cb11-12"><a href="#cb11-12" tabindex="-1"></a>              <span class="st">&quot;Canada&quot;</span>, <span class="st">&quot;France&quot;</span>, <span class="st">&quot;Italy&quot;</span>),</span>
-<span id="cb11-13"><a href="#cb11-13" tabindex="-1"></a>  <span class="at">population_m =</span> <span class="fu">c</span>(<span class="dv">214</span>, <span class="dv">1408</span>, <span class="dv">84</span>, <span class="dv">125</span>, <span class="dv">38</span>, <span class="dv">68</span>, <span class="dv">59</span>),</span>
-<span id="cb11-14"><a href="#cb11-14" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb11-15"><a href="#cb11-15" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a><span class="co"># Simulating PDF copy-paste artifacts:</span></span>
+<span id="cb24-2"><a href="#cb24-2" tabindex="-1"></a><span class="co"># \u00A0 is non-breaking space, \u200B is zero-width space</span></span>
+<span id="cb24-3"><a href="#cb24-3" tabindex="-1"></a>pdf_data <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb24-4"><a href="#cb24-4" tabindex="-1"></a>  <span class="at">country =</span> <span class="fu">c</span>(<span class="st">&quot;Brazil&quot;</span>, <span class="st">&quot;India\u200B&quot;</span>, <span class="st">&quot;Germany&quot;</span>,</span>
+<span id="cb24-5"><a href="#cb24-5" tabindex="-1"></a>              <span class="st">&quot;Japan\u00A0&quot;</span>, <span class="st">&quot;Canada&quot;</span>, <span class="st">&quot;France\u200B&quot;</span>),</span>
+<span id="cb24-6"><a href="#cb24-6" tabindex="-1"></a>  <span class="at">prevalence =</span> <span class="fu">c</span>(<span class="fl">12.3</span>, <span class="fl">8.7</span>, <span class="fl">5.1</span>, <span class="fl">3.9</span>, <span class="fl">6.2</span>, <span class="fl">4.8</span>),</span>
+<span id="cb24-7"><a href="#cb24-7" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb24-8"><a href="#cb24-8" tabindex="-1"></a>)</span>
+<span id="cb24-9"><a href="#cb24-9" tabindex="-1"></a></span>
+<span id="cb24-10"><a href="#cb24-10" tabindex="-1"></a>reference <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb24-11"><a href="#cb24-11" tabindex="-1"></a>  <span class="at">country =</span> <span class="fu">c</span>(<span class="st">&quot;Brazil&quot;</span>, <span class="st">&quot;India&quot;</span>, <span class="st">&quot;Germany&quot;</span>, <span class="st">&quot;Japan&quot;</span>,</span>
+<span id="cb24-12"><a href="#cb24-12" tabindex="-1"></a>              <span class="st">&quot;Canada&quot;</span>, <span class="st">&quot;France&quot;</span>, <span class="st">&quot;Italy&quot;</span>),</span>
+<span id="cb24-13"><a href="#cb24-13" tabindex="-1"></a>  <span class="at">population_m =</span> <span class="fu">c</span>(<span class="dv">214</span>, <span class="dv">1408</span>, <span class="dv">84</span>, <span class="dv">125</span>, <span class="dv">38</span>, <span class="dv">68</span>, <span class="dv">59</span>),</span>
+<span id="cb24-14"><a href="#cb24-14" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb24-15"><a href="#cb24-15" tabindex="-1"></a>)</span></code></pre></div>
 <p>Printing the PDF data shows nothing wrong:</p>
-<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a>pdf_data<span class="sc">$</span>country</span>
-<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a><span class="co">#&gt; [1] &quot;Brazil&quot;  &quot;India​&quot;   &quot;Germany&quot; &quot;Japan &quot;  &quot;Canada&quot;  &quot;France​&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb25"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb25-1"><a href="#cb25-1" tabindex="-1"></a>pdf_data<span class="sc">$</span>country</span>
+<span id="cb25-2"><a href="#cb25-2" tabindex="-1"></a><span class="co">#&gt; [1] &quot;Brazil&quot;  &quot;India​&quot;   &quot;Germany&quot; &quot;Japan &quot;  &quot;Canada&quot;  &quot;France​&quot;</span></span></code></pre></div>
 <p>The zero-width space after “India” and “France” occupies zero pixels.
 The non-breaking space after “Japan” renders like a regular space but is
 U+00A0, not U+0020 – <code>trimws()</code> will not always remove it.
 The merge reflects this:</p>
-<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">merge</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>))</span>
-<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a><span class="co">#&gt; [1] 3</span></span></code></pre></div>
+<div class="sourceCode" id="cb26"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">merge</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>))</span>
+<span id="cb26-2"><a href="#cb26-2" tabindex="-1"></a><span class="co">#&gt; [1] 3</span></span></code></pre></div>
 <p>Three of six countries match. <code>join_spy()</code> detects the
 invisible characters:</p>
-<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>)</span></code></pre></div>
-<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>)</span>
-<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 3 value(s)</span></span>
-<span id="cb15-3"><a href="#cb15-3" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>))</span>
-<span id="cb15-4"><a href="#cb15-4" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
+<div class="sourceCode" id="cb27"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb27-1"><a href="#cb27-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>)</span>
+<span id="cb27-2"><a href="#cb27-2" tabindex="-1"></a>report</span>
+<span id="cb27-3"><a href="#cb27-3" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-4"><a href="#cb27-4" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb27-5"><a href="#cb27-5" tabindex="-1"></a><span class="co">#&gt; Join columns: country</span></span>
+<span id="cb27-6"><a href="#cb27-6" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-7"><a href="#cb27-7" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb27-8"><a href="#cb27-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-9"><a href="#cb27-9" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 6 Unique keys: 6 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb27-10"><a href="#cb27-10" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 7 Unique keys: 7 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb27-11"><a href="#cb27-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-12"><a href="#cb27-12" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb27-13"><a href="#cb27-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-14"><a href="#cb27-14" tabindex="-1"></a><span class="co">#&gt; Keys in both: 3</span></span>
+<span id="cb27-15"><a href="#cb27-15" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 3</span></span>
+<span id="cb27-16"><a href="#cb27-16" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 4</span></span>
+<span id="cb27-17"><a href="#cb27-17" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;50%&quot;</span></span>
+<span id="cb27-18"><a href="#cb27-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-19"><a href="#cb27-19" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb27-20"><a href="#cb27-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-21"><a href="#cb27-21" tabindex="-1"></a><span class="co">#&gt; ! Left column &#39;country&#39; has encoding issues (invisible chars or mixed encoding)</span></span>
+<span id="cb27-22"><a href="#cb27-22" tabindex="-1"></a><span class="co">#&gt; ℹ 3 near-match(es) found (e.g., &#39;India​&#39; ~ &#39;India&#39;, &#39;Japan &#39; ~ &#39;Japan&#39;, &#39;France​&#39; ~ &#39;France&#39;) - possible typos?</span></span>
+<span id="cb27-23"><a href="#cb27-23" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-24"><a href="#cb27-24" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb27-25"><a href="#cb27-25" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb27-26"><a href="#cb27-26" tabindex="-1"></a><span class="co">#&gt; inner_join: 3</span></span>
+<span id="cb27-27"><a href="#cb27-27" tabindex="-1"></a><span class="co">#&gt; left_join: 6</span></span>
+<span id="cb27-28"><a href="#cb27-28" tabindex="-1"></a><span class="co">#&gt; right_join: 7</span></span>
+<span id="cb27-29"><a href="#cb27-29" tabindex="-1"></a><span class="co">#&gt; full_join: 10</span></span></code></pre></div>
+<p>Alongside the encoding warning, the near-match check reaches the same
+conclusion from a different direction: each contaminated name sits one
+edit away from its clean counterpart in the reference table.</p>
+<div class="sourceCode" id="cb28"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(pdf_data, reference, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>)</span>
+<span id="cb28-2"><a href="#cb28-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 3 value(s)</span></span>
+<span id="cb28-3"><a href="#cb28-3" tabindex="-1"></a><span class="fu">nrow</span>(<span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;country&quot;</span>))</span>
+<span id="cb28-4"><a href="#cb28-4" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
 <p>Six matches. PDF copy-paste is the most common source of these
 artifacts, but web scraping, OCR output, and legacy mainframe exports
 can produce them too. One useful debugging trick outside of joinspy:
 <code>nchar(&quot;India\u200B&quot;)</code> returns 6, not 5. But that requires
 already suspecting the problem.</p>
+<p>Each watched code point has a typical entry route. The non-breaking
+space comes from typesetting: PDF layout engines and HTML
+(<code>&amp;nbsp;</code>) use it to keep words on one line, and the
+clipboard preserves it faithfully. Zero-width spaces are inserted by
+some content-management systems and word processors as line-break hints.
+The byte order mark arrives at the front of files saved as “UTF-8 with
+BOM” by some Windows editors, where it fuses with the first field name
+or the first key of a CSV. All of these survive visual inspection, and
+all of them disappear under <code>join_repair()</code>’s
+invisible-character pass. Stripping them right after
+<code>read.csv()</code> keeps them out of every downstream join at
+once.</p>
 </div>
 <div id="scenario-4-the-slowly-growing-mismatch" class="section level2">
 <h2>Scenario 4: The Slowly Growing Mismatch</h2>
@@ -512,65 +858,109 @@ until finance flagged a margin discrepancy in April.</p>
 warehouse team in December. The canonical product code format was
 <code>&quot;WDG-100&quot;</code> – uppercase prefix, dash, three-digit suffix. The
 new clerk sometimes omitted the dash, sometimes typed lowercase. The
-warehouse system did fuzzy matching internally, so it accepted the
-codes. The ETL join did not.</p>
-<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a><span class="co"># Product catalogue (canonical format)</span></span>
-<span id="cb16-2"><a href="#cb16-2" tabindex="-1"></a>catalogue <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb16-3"><a href="#cb16-3" tabindex="-1"></a>  <span class="at">product_code =</span> <span class="fu">c</span>(<span class="st">&quot;WDG-100&quot;</span>, <span class="st">&quot;WDG-101&quot;</span>, <span class="st">&quot;WDG-102&quot;</span>,</span>
-<span id="cb16-4"><a href="#cb16-4" tabindex="-1"></a>                   <span class="st">&quot;WDG-103&quot;</span>, <span class="st">&quot;WDG-104&quot;</span>, <span class="st">&quot;WDG-105&quot;</span>),</span>
-<span id="cb16-5"><a href="#cb16-5" tabindex="-1"></a>  <span class="at">product_name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget A&quot;</span>, <span class="st">&quot;Widget B&quot;</span>, <span class="st">&quot;Widget C&quot;</span>,</span>
-<span id="cb16-6"><a href="#cb16-6" tabindex="-1"></a>                   <span class="st">&quot;Widget D&quot;</span>, <span class="st">&quot;Widget E&quot;</span>, <span class="st">&quot;Widget F&quot;</span>),</span>
-<span id="cb16-7"><a href="#cb16-7" tabindex="-1"></a>  <span class="at">margin =</span> <span class="fu">c</span>(<span class="fl">0.35</span>, <span class="fl">0.28</span>, <span class="fl">0.42</span>, <span class="fl">0.31</span>, <span class="fl">0.39</span>, <span class="fl">0.25</span>),</span>
-<span id="cb16-8"><a href="#cb16-8" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb16-9"><a href="#cb16-9" tabindex="-1"></a>)</span>
-<span id="cb16-10"><a href="#cb16-10" tabindex="-1"></a></span>
-<span id="cb16-11"><a href="#cb16-11" tabindex="-1"></a><span class="co"># Recent transactions (mix of old and new clerk entries)</span></span>
-<span id="cb16-12"><a href="#cb16-12" tabindex="-1"></a>transactions <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb16-13"><a href="#cb16-13" tabindex="-1"></a>  <span class="at">product_code =</span> <span class="fu">c</span>(<span class="st">&quot;WDG-100&quot;</span>, <span class="st">&quot;WDG-101&quot;</span>, <span class="st">&quot;WDG102&quot;</span>,</span>
-<span id="cb16-14"><a href="#cb16-14" tabindex="-1"></a>                   <span class="st">&quot;wdg-103&quot;</span>, <span class="st">&quot;WDG-104&quot;</span>, <span class="st">&quot;wdg105&quot;</span>,</span>
-<span id="cb16-15"><a href="#cb16-15" tabindex="-1"></a>                   <span class="st">&quot;WDG-100&quot;</span>, <span class="st">&quot;WDG103&quot;</span>),</span>
-<span id="cb16-16"><a href="#cb16-16" tabindex="-1"></a>  <span class="at">quantity =</span> <span class="fu">c</span>(<span class="dv">5</span>, <span class="dv">3</span>, <span class="dv">7</span>, <span class="dv">2</span>, <span class="dv">4</span>, <span class="dv">6</span>, <span class="dv">1</span>, <span class="dv">8</span>),</span>
-<span id="cb16-17"><a href="#cb16-17" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb16-18"><a href="#cb16-18" tabindex="-1"></a>)</span></code></pre></div>
+warehouse system did fuzzy matching internally, so it accepted codes
+that the ETL join’s exact comparison rejected.</p>
+<div class="sourceCode" id="cb29"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb29-1"><a href="#cb29-1" tabindex="-1"></a><span class="co"># Product catalogue (canonical format)</span></span>
+<span id="cb29-2"><a href="#cb29-2" tabindex="-1"></a>catalogue <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb29-3"><a href="#cb29-3" tabindex="-1"></a>  <span class="at">product_code =</span> <span class="fu">c</span>(<span class="st">&quot;WDG-100&quot;</span>, <span class="st">&quot;WDG-101&quot;</span>, <span class="st">&quot;WDG-102&quot;</span>,</span>
+<span id="cb29-4"><a href="#cb29-4" tabindex="-1"></a>                   <span class="st">&quot;WDG-103&quot;</span>, <span class="st">&quot;WDG-104&quot;</span>, <span class="st">&quot;WDG-105&quot;</span>),</span>
+<span id="cb29-5"><a href="#cb29-5" tabindex="-1"></a>  <span class="at">product_name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget A&quot;</span>, <span class="st">&quot;Widget B&quot;</span>, <span class="st">&quot;Widget C&quot;</span>,</span>
+<span id="cb29-6"><a href="#cb29-6" tabindex="-1"></a>                   <span class="st">&quot;Widget D&quot;</span>, <span class="st">&quot;Widget E&quot;</span>, <span class="st">&quot;Widget F&quot;</span>),</span>
+<span id="cb29-7"><a href="#cb29-7" tabindex="-1"></a>  <span class="at">margin =</span> <span class="fu">c</span>(<span class="fl">0.35</span>, <span class="fl">0.28</span>, <span class="fl">0.42</span>, <span class="fl">0.31</span>, <span class="fl">0.39</span>, <span class="fl">0.25</span>),</span>
+<span id="cb29-8"><a href="#cb29-8" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb29-9"><a href="#cb29-9" tabindex="-1"></a>)</span>
+<span id="cb29-10"><a href="#cb29-10" tabindex="-1"></a></span>
+<span id="cb29-11"><a href="#cb29-11" tabindex="-1"></a><span class="co"># Recent transactions (mix of old and new clerk entries)</span></span>
+<span id="cb29-12"><a href="#cb29-12" tabindex="-1"></a>transactions <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb29-13"><a href="#cb29-13" tabindex="-1"></a>  <span class="at">product_code =</span> <span class="fu">c</span>(<span class="st">&quot;WDG-100&quot;</span>, <span class="st">&quot;WDG-101&quot;</span>, <span class="st">&quot;WDG102&quot;</span>,</span>
+<span id="cb29-14"><a href="#cb29-14" tabindex="-1"></a>                   <span class="st">&quot;wdg-103&quot;</span>, <span class="st">&quot;WDG-104&quot;</span>, <span class="st">&quot;wdg105&quot;</span>,</span>
+<span id="cb29-15"><a href="#cb29-15" tabindex="-1"></a>                   <span class="st">&quot;WDG-100&quot;</span>, <span class="st">&quot;WDG103&quot;</span>),</span>
+<span id="cb29-16"><a href="#cb29-16" tabindex="-1"></a>  <span class="at">quantity =</span> <span class="fu">c</span>(<span class="dv">5</span>, <span class="dv">3</span>, <span class="dv">7</span>, <span class="dv">2</span>, <span class="dv">4</span>, <span class="dv">6</span>, <span class="dv">1</span>, <span class="dv">8</span>),</span>
+<span id="cb29-17"><a href="#cb29-17" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb29-18"><a href="#cb29-18" tabindex="-1"></a>)</span></code></pre></div>
 <p>Some codes match and some do not, which makes partial failures harder
 to spot than complete ones.</p>
-<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(transactions, catalogue, <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb30"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(transactions, catalogue, <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>)</span>
+<span id="cb30-2"><a href="#cb30-2" tabindex="-1"></a>report</span>
+<span id="cb30-3"><a href="#cb30-3" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-4"><a href="#cb30-4" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb30-5"><a href="#cb30-5" tabindex="-1"></a><span class="co">#&gt; Join columns: product_code</span></span>
+<span id="cb30-6"><a href="#cb30-6" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-7"><a href="#cb30-7" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb30-8"><a href="#cb30-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-9"><a href="#cb30-9" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 8 Unique keys: 7 Duplicate keys: 1 NA keys: 0</span></span>
+<span id="cb30-10"><a href="#cb30-10" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 6 Unique keys: 6 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb30-11"><a href="#cb30-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-12"><a href="#cb30-12" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb30-13"><a href="#cb30-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-14"><a href="#cb30-14" tabindex="-1"></a><span class="co">#&gt; Keys in both: 3</span></span>
+<span id="cb30-15"><a href="#cb30-15" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 4</span></span>
+<span id="cb30-16"><a href="#cb30-16" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 3</span></span>
+<span id="cb30-17"><a href="#cb30-17" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;42.9%&quot;</span></span>
+<span id="cb30-18"><a href="#cb30-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-19"><a href="#cb30-19" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb30-20"><a href="#cb30-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-21"><a href="#cb30-21" tabindex="-1"></a><span class="co">#&gt; ! Left table has 1 duplicate key(s) affecting 2 rows - may cause row multiplication</span></span>
+<span id="cb30-22"><a href="#cb30-22" tabindex="-1"></a><span class="co">#&gt; ! 1 key(s) would match if case-insensitive (e.g., &#39;wdg-103&#39; vs &#39;WDG-103&#39;)</span></span>
+<span id="cb30-23"><a href="#cb30-23" tabindex="-1"></a><span class="co">#&gt; ℹ 10 near-match(es) found (e.g., &#39;WDG102&#39; ~ &#39;WDG-102&#39;, &#39;WDG103&#39; ~ &#39;WDG-103&#39;, &#39;WDG102&#39; ~ &#39;WDG-100&#39;) - possible typos?</span></span>
+<span id="cb30-24"><a href="#cb30-24" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-25"><a href="#cb30-25" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb30-26"><a href="#cb30-26" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb30-27"><a href="#cb30-27" tabindex="-1"></a><span class="co">#&gt; inner_join: 4</span></span>
+<span id="cb30-28"><a href="#cb30-28" tabindex="-1"></a><span class="co">#&gt; left_join: 8</span></span>
+<span id="cb30-29"><a href="#cb30-29" tabindex="-1"></a><span class="co">#&gt; right_join: 7</span></span>
+<span id="cb30-30"><a href="#cb30-30" tabindex="-1"></a><span class="co">#&gt; full_join: 11</span></span></code></pre></div>
+<p>The report stacks several findings: the case check catches
+<code>&quot;wdg-103&quot;</code>, and the near-match check lines the dashless
+codes up against catalogue entries one or two edits away.</p>
 <p>Here is where this scenario differs from the previous ones.
 <code>join_repair()</code> can fix the case issue, but it cannot insert
 the missing dashes – that requires domain knowledge about the code
 format.</p>
 <p>We can do a dry run to see what <code>join_repair()</code> would
 fix:</p>
-<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" tabindex="-1"></a><span class="fu">join_repair</span>(transactions, catalogue,</span>
-<span id="cb18-2"><a href="#cb18-2" tabindex="-1"></a>            <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>,</span>
-<span id="cb18-3"><a href="#cb18-3" tabindex="-1"></a>            <span class="at">standardize_case =</span> <span class="st">&quot;upper&quot;</span>,</span>
-<span id="cb18-4"><a href="#cb18-4" tabindex="-1"></a>            <span class="at">dry_run =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb18-5"><a href="#cb18-5" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb18-6"><a href="#cb18-6" tabindex="-1"></a><span class="co">#&gt; ── Repair Preview (Dry Run) ────────────────────────────────────────────────────</span></span>
-<span id="cb18-7"><a href="#cb18-7" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb18-8"><a href="#cb18-8" tabindex="-1"></a><span class="co">#&gt; ── Left table (x) ──</span></span>
-<span id="cb18-9"><a href="#cb18-9" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb18-10"><a href="#cb18-10" tabindex="-1"></a><span class="co">#&gt; ℹ product_code: upper case (2)</span></span></code></pre></div>
+<div class="sourceCode" id="cb31"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb31-1"><a href="#cb31-1" tabindex="-1"></a><span class="fu">join_repair</span>(transactions, catalogue,</span>
+<span id="cb31-2"><a href="#cb31-2" tabindex="-1"></a>            <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>,</span>
+<span id="cb31-3"><a href="#cb31-3" tabindex="-1"></a>            <span class="at">standardize_case =</span> <span class="st">&quot;upper&quot;</span>,</span>
+<span id="cb31-4"><a href="#cb31-4" tabindex="-1"></a>            <span class="at">dry_run =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb31-5"><a href="#cb31-5" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb31-6"><a href="#cb31-6" tabindex="-1"></a><span class="co">#&gt; ── Repair Preview (Dry Run) ────────────────────────────────────────────────────</span></span>
+<span id="cb31-7"><a href="#cb31-7" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb31-8"><a href="#cb31-8" tabindex="-1"></a><span class="co">#&gt; ── Left table (x) ──</span></span>
+<span id="cb31-9"><a href="#cb31-9" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb31-10"><a href="#cb31-10" tabindex="-1"></a><span class="co">#&gt; ℹ product_code: upper case (2)</span></span></code></pre></div>
 <p>After applying the mechanical fixes:</p>
-<div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(transactions, catalogue,</span>
-<span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a>                        <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>,</span>
-<span id="cb19-3"><a href="#cb19-3" tabindex="-1"></a>                        <span class="at">standardize_case =</span> <span class="st">&quot;upper&quot;</span>)</span>
-<span id="cb19-4"><a href="#cb19-4" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span></code></pre></div>
+<div class="sourceCode" id="cb32"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb32-1"><a href="#cb32-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(transactions, catalogue,</span>
+<span id="cb32-2"><a href="#cb32-2" tabindex="-1"></a>                        <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>,</span>
+<span id="cb32-3"><a href="#cb32-3" tabindex="-1"></a>                        <span class="at">standardize_case =</span> <span class="st">&quot;upper&quot;</span>)</span>
+<span id="cb32-4"><a href="#cb32-4" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span></code></pre></div>
 <p>The case issues are resolved, but the missing dashes remain. A manual
 transformation handles those:</p>
-<div class="sourceCode" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" tabindex="-1"></a><span class="co"># Manual fix: insert dash if missing in product codes matching the pattern</span></span>
-<span id="cb20-2"><a href="#cb20-2" tabindex="-1"></a>fix_codes <span class="ot">&lt;-</span> <span class="cf">function</span>(codes) {</span>
-<span id="cb20-3"><a href="#cb20-3" tabindex="-1"></a>  <span class="fu">gsub</span>(<span class="st">&quot;^([A-Z]{3})(</span><span class="sc">\\</span><span class="st">d)&quot;</span>, <span class="st">&quot;</span><span class="sc">\\</span><span class="st">1-</span><span class="sc">\\</span><span class="st">2&quot;</span>, codes)</span>
-<span id="cb20-4"><a href="#cb20-4" tabindex="-1"></a>}</span>
-<span id="cb20-5"><a href="#cb20-5" tabindex="-1"></a>repaired<span class="sc">$</span>x<span class="sc">$</span>product_code <span class="ot">&lt;-</span> <span class="fu">fix_codes</span>(repaired<span class="sc">$</span>x<span class="sc">$</span>product_code)</span></code></pre></div>
-<div class="sourceCode" id="cb21"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>)</span>
-<span id="cb21-2"><a href="#cb21-2" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
-<span id="cb21-3"><a href="#cb21-3" tabindex="-1"></a><span class="co">#&gt; [1] 8</span></span></code></pre></div>
+<div class="sourceCode" id="cb33"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb33-1"><a href="#cb33-1" tabindex="-1"></a><span class="co"># Manual fix: insert dash if missing in product codes matching the pattern</span></span>
+<span id="cb33-2"><a href="#cb33-2" tabindex="-1"></a>fix_codes <span class="ot">&lt;-</span> <span class="cf">function</span>(codes) {</span>
+<span id="cb33-3"><a href="#cb33-3" tabindex="-1"></a>  <span class="fu">gsub</span>(<span class="st">&quot;^([A-Z]{3})(</span><span class="sc">\\</span><span class="st">d)&quot;</span>, <span class="st">&quot;</span><span class="sc">\\</span><span class="st">1-</span><span class="sc">\\</span><span class="st">2&quot;</span>, codes)</span>
+<span id="cb33-4"><a href="#cb33-4" tabindex="-1"></a>}</span>
+<span id="cb33-5"><a href="#cb33-5" tabindex="-1"></a>repaired<span class="sc">$</span>x<span class="sc">$</span>product_code <span class="ot">&lt;-</span> <span class="fu">fix_codes</span>(repaired<span class="sc">$</span>x<span class="sc">$</span>product_code)</span></code></pre></div>
+<div class="sourceCode" id="cb34"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb34-1"><a href="#cb34-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="st">&quot;product_code&quot;</span>)</span>
+<span id="cb34-2"><a href="#cb34-2" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
+<span id="cb34-3"><a href="#cb34-3" tabindex="-1"></a><span class="co">#&gt; [1] 8</span></span></code></pre></div>
 <p>All eight transactions match. <code>join_repair()</code> handles
 context-free transformations (trimming, case normalization, stripping
 invisible characters). Inserting a dash into <code>&quot;WDG102&quot;</code>
 requires knowing the canonical format – that fix has to come from
 someone who understands the data.</p>
+<p>The upstream story here is the most general of the five: two systems
+with different matching strictness, connected by people. The warehouse
+software tolerated sloppy codes because its internal lookup was fuzzy;
+the ETL join was exact; the clerk had no way to see the difference. Keys
+typed by humans drift like this wherever entry goes unvalidated. A rule
+rejecting anything that fails <code>^[A-Z]{3}-\d{3}$</code> at the
+warehouse boundary would have caught every malformed code in December.
+The drift is also visible from the R side: a match rate sliding from 99%
+to 94% over three months is a measurable signal, and logging a report
+per pipeline run (<code>vignette(&quot;production&quot;)</code> covers
+<code>log_report()</code> and <code>set_log_file()</code>) turns that
+slide into an alert long before finance notices the margins.</p>
 </div>
 <div id="scenario-5-compound-keys" class="section level2">
 <h2>Scenario 5: Compound Keys</h2>
@@ -578,40 +968,87 @@ someone who understands the data.</p>
 indicators and regional population estimates, keyed on region and year.
 The year column is numeric and matches without trouble. The region
 column has a whitespace problem that affects only some records.</p>
-<div class="sourceCode" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" tabindex="-1"></a>economics <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb22-2"><a href="#cb22-2" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">c</span>(<span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific &quot;</span>,</span>
-<span id="cb22-3"><a href="#cb22-3" tabindex="-1"></a>             <span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific &quot;</span>),</span>
-<span id="cb22-4"><a href="#cb22-4" tabindex="-1"></a>  <span class="at">year =</span> <span class="fu">c</span>(<span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2023</span>, <span class="dv">2023</span>, <span class="dv">2023</span>),</span>
-<span id="cb22-5"><a href="#cb22-5" tabindex="-1"></a>  <span class="at">gdp_growth =</span> <span class="fu">c</span>(<span class="fl">2.1</span>, <span class="fl">1.8</span>, <span class="fl">4.2</span>, <span class="fl">1.9</span>, <span class="fl">0.9</span>, <span class="fl">3.8</span>),</span>
-<span id="cb22-6"><a href="#cb22-6" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb22-7"><a href="#cb22-7" tabindex="-1"></a>)</span>
-<span id="cb22-8"><a href="#cb22-8" tabindex="-1"></a></span>
-<span id="cb22-9"><a href="#cb22-9" tabindex="-1"></a>population <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb22-10"><a href="#cb22-10" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">c</span>(<span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific&quot;</span>,</span>
-<span id="cb22-11"><a href="#cb22-11" tabindex="-1"></a>             <span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific&quot;</span>),</span>
-<span id="cb22-12"><a href="#cb22-12" tabindex="-1"></a>  <span class="at">year =</span> <span class="fu">c</span>(<span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2023</span>, <span class="dv">2023</span>, <span class="dv">2023</span>),</span>
-<span id="cb22-13"><a href="#cb22-13" tabindex="-1"></a>  <span class="at">pop_millions =</span> <span class="fu">c</span>(<span class="dv">580</span>, <span class="dv">450</span>, <span class="dv">4300</span>, <span class="dv">585</span>, <span class="dv">448</span>, <span class="dv">4350</span>),</span>
-<span id="cb22-14"><a href="#cb22-14" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb22-15"><a href="#cb22-15" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb35"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb35-1"><a href="#cb35-1" tabindex="-1"></a>economics <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb35-2"><a href="#cb35-2" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">c</span>(<span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific &quot;</span>,</span>
+<span id="cb35-3"><a href="#cb35-3" tabindex="-1"></a>             <span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific &quot;</span>),</span>
+<span id="cb35-4"><a href="#cb35-4" tabindex="-1"></a>  <span class="at">year =</span> <span class="fu">c</span>(<span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2023</span>, <span class="dv">2023</span>, <span class="dv">2023</span>),</span>
+<span id="cb35-5"><a href="#cb35-5" tabindex="-1"></a>  <span class="at">gdp_growth =</span> <span class="fu">c</span>(<span class="fl">2.1</span>, <span class="fl">1.8</span>, <span class="fl">4.2</span>, <span class="fl">1.9</span>, <span class="fl">0.9</span>, <span class="fl">3.8</span>),</span>
+<span id="cb35-6"><a href="#cb35-6" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb35-7"><a href="#cb35-7" tabindex="-1"></a>)</span>
+<span id="cb35-8"><a href="#cb35-8" tabindex="-1"></a></span>
+<span id="cb35-9"><a href="#cb35-9" tabindex="-1"></a>population <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb35-10"><a href="#cb35-10" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">c</span>(<span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific&quot;</span>,</span>
+<span id="cb35-11"><a href="#cb35-11" tabindex="-1"></a>             <span class="st">&quot;North America&quot;</span>, <span class="st">&quot;Europe&quot;</span>, <span class="st">&quot;Asia Pacific&quot;</span>),</span>
+<span id="cb35-12"><a href="#cb35-12" tabindex="-1"></a>  <span class="at">year =</span> <span class="fu">c</span>(<span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2022</span>, <span class="dv">2023</span>, <span class="dv">2023</span>, <span class="dv">2023</span>),</span>
+<span id="cb35-13"><a href="#cb35-13" tabindex="-1"></a>  <span class="at">pop_millions =</span> <span class="fu">c</span>(<span class="dv">580</span>, <span class="dv">450</span>, <span class="dv">4300</span>, <span class="dv">585</span>, <span class="dv">448</span>, <span class="dv">4350</span>),</span>
+<span id="cb35-14"><a href="#cb35-14" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb35-15"><a href="#cb35-15" tabindex="-1"></a>)</span></code></pre></div>
 <p>In a compound key join, both columns must match. The year column is
 fine everywhere, but <code>&quot;Asia Pacific &quot;</code> with a trailing space
 will not match <code>&quot;Asia Pacific&quot;</code>.</p>
-<div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a>merged <span class="ot">&lt;-</span> <span class="fu">merge</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
-<span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a><span class="fu">nrow</span>(merged)</span>
-<span id="cb23-3"><a href="#cb23-3" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
+<div class="sourceCode" id="cb36"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb36-1"><a href="#cb36-1" tabindex="-1"></a>merged <span class="ot">&lt;-</span> <span class="fu">merge</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
+<span id="cb36-2"><a href="#cb36-2" tabindex="-1"></a><span class="fu">nrow</span>(merged)</span>
+<span id="cb36-3"><a href="#cb36-3" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
 <p>Four rows instead of six. North America and Europe match; Asia
 Pacific does not, because of the trailing space.</p>
 <p><code>join_spy()</code> pinpoints which column in the compound key
 has the problem:</p>
-<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span></code></pre></div>
-<div class="sourceCode" id="cb25"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb25-1"><a href="#cb25-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
-<span id="cb25-2"><a href="#cb25-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
-<span id="cb25-3"><a href="#cb25-3" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
-<span id="cb25-4"><a href="#cb25-4" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
-<span id="cb25-5"><a href="#cb25-5" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
+<div class="sourceCode" id="cb37"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb37-1"><a href="#cb37-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
+<span id="cb37-2"><a href="#cb37-2" tabindex="-1"></a>report</span>
+<span id="cb37-3"><a href="#cb37-3" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-4"><a href="#cb37-4" tabindex="-1"></a><span class="co">#&gt; ── Join Diagnostic Report ──────────────────────────────────────────────────────</span></span>
+<span id="cb37-5"><a href="#cb37-5" tabindex="-1"></a><span class="co">#&gt; Join columns: region, year</span></span>
+<span id="cb37-6"><a href="#cb37-6" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-7"><a href="#cb37-7" tabindex="-1"></a><span class="co">#&gt; ── Table Summary ──</span></span>
+<span id="cb37-8"><a href="#cb37-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-9"><a href="#cb37-9" tabindex="-1"></a><span class="co">#&gt; Left table: Rows: 6 Unique keys: 6 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb37-10"><a href="#cb37-10" tabindex="-1"></a><span class="co">#&gt; Right table: Rows: 6 Unique keys: 6 Duplicate keys: 0 NA keys: 0</span></span>
+<span id="cb37-11"><a href="#cb37-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-12"><a href="#cb37-12" tabindex="-1"></a><span class="co">#&gt; ── Match Analysis ──</span></span>
+<span id="cb37-13"><a href="#cb37-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-14"><a href="#cb37-14" tabindex="-1"></a><span class="co">#&gt; Keys in both: 4</span></span>
+<span id="cb37-15"><a href="#cb37-15" tabindex="-1"></a><span class="co">#&gt; Keys only in left: 2</span></span>
+<span id="cb37-16"><a href="#cb37-16" tabindex="-1"></a><span class="co">#&gt; Keys only in right: 2</span></span>
+<span id="cb37-17"><a href="#cb37-17" tabindex="-1"></a><span class="co">#&gt; Match rate (left): &quot;66.7%&quot;</span></span>
+<span id="cb37-18"><a href="#cb37-18" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-19"><a href="#cb37-19" tabindex="-1"></a><span class="co">#&gt; ── Issues Detected ──</span></span>
+<span id="cb37-20"><a href="#cb37-20" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-21"><a href="#cb37-21" tabindex="-1"></a><span class="co">#&gt; ! Left column &#39;region&#39; has 1 value(s) with leading/trailing whitespace</span></span>
+<span id="cb37-22"><a href="#cb37-22" tabindex="-1"></a><span class="co">#&gt; ℹ 1 near-match(es) found (e.g., &#39;Asia Pacific &#39; ~ &#39;Asia Pacific&#39;) - possible typos?</span></span>
+<span id="cb37-23"><a href="#cb37-23" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-24"><a href="#cb37-24" tabindex="-1"></a><span class="co">#&gt; ── Per-Column Breakdown ──</span></span>
+<span id="cb37-25"><a href="#cb37-25" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-26"><a href="#cb37-26" tabindex="-1"></a><span class="co">#&gt; region: &quot;66.7%&quot; match rate (2/3)</span></span>
+<span id="cb37-27"><a href="#cb37-27" tabindex="-1"></a><span class="co">#&gt; year: &quot;100%&quot; match rate (2/2)</span></span>
+<span id="cb37-28"><a href="#cb37-28" tabindex="-1"></a><span class="co">#&gt; ℹ Lowest match rate: region</span></span>
+<span id="cb37-29"><a href="#cb37-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-30"><a href="#cb37-30" tabindex="-1"></a><span class="co">#&gt; ── Expected Row Counts ──</span></span>
+<span id="cb37-31"><a href="#cb37-31" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-32"><a href="#cb37-32" tabindex="-1"></a><span class="co">#&gt; inner_join: 4</span></span>
+<span id="cb37-33"><a href="#cb37-33" tabindex="-1"></a><span class="co">#&gt; left_join: 6</span></span>
+<span id="cb37-34"><a href="#cb37-34" tabindex="-1"></a><span class="co">#&gt; right_join: 6</span></span>
+<span id="cb37-35"><a href="#cb37-35" tabindex="-1"></a><span class="co">#&gt; full_join: 8</span></span></code></pre></div>
+<p>The per-column breakdown shows the year column matching fully while
+region falls short, and names region as the column with the lowest match
+rate. From there the whitespace warning above it identifies the exact
+values at fault.</p>
+<div class="sourceCode" id="cb38"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb38-1"><a href="#cb38-1" tabindex="-1"></a>repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(economics, population, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
+<span id="cb38-2"><a href="#cb38-2" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span>
+<span id="cb38-3"><a href="#cb38-3" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">merge</span>(repaired<span class="sc">$</span>x, repaired<span class="sc">$</span>y, <span class="at">by =</span> <span class="fu">c</span>(<span class="st">&quot;region&quot;</span>, <span class="st">&quot;year&quot;</span>))</span>
+<span id="cb38-4"><a href="#cb38-4" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
+<span id="cb38-5"><a href="#cb38-5" tabindex="-1"></a><span class="co">#&gt; [1] 6</span></span></code></pre></div>
 <p>Six rows. With compound keys, a string issue in any single column is
 enough to break the match. The more columns in the key, the more places
 a byte-level discrepancy can occur.</p>
+<p>Compound keys generalize everything in this vignette: each column
+added to <code>by</code> is one more surface where any of these defects
+can land. Region-by-year panels, site-by-date field records,
+patient-by-visit tables: wherever observations are keyed by a
+combination of identifiers, the component columns tend to come from
+different upstream systems with different hygiene. An aggregate match
+rate cannot say which component is at fault. The per-column breakdown
+can, and checking it first rules out most candidate explanations before
+any bytes get inspected.</p>
 </div>
 <div id="the-pattern" class="section level2">
 <h2>The Pattern</h2>
@@ -625,6 +1062,50 @@ invisible Unicode are all one-line operations.</p>
 <p><code>join_spy()</code> surfaces the cause directly, which is
 especially useful with data from external sources, manual entry, PDF
 extraction, or cross-system integrations.</p>
+<p>Worked the other way around, the shared structure becomes a
+checklist. Each question in a join post-mortem maps to one call:</p>
+<ul>
+<li>Is this join safe to run? <code>join_spy(x, y, by)</code> gives the
+full report: key summaries, match rates, detected issues, and expected
+row counts for all four join types.</li>
+<li>I want a yes/no gate in a script. <code>key_check(x, y, by)</code>
+prints a short status and invisibly returns a logical;
+<code>warn = FALSE</code> makes it silent.</li>
+<li>Which rows share a key? <code>key_duplicates(data, by)</code>
+returns the duplicated rows with a <code>.n_duplicates</code> count
+column.</li>
+<li>What would a cleanup change? <code>join_repair()</code> with
+<code>dry_run = TRUE</code> previews the repairs without touching the
+data.</li>
+<li>Fix the mechanical problems. <code>join_repair()</code> trims
+whitespace, standardizes case, strips the invisible characters, and
+optionally converts empty strings to NA.</li>
+<li>Show me the fix as code. <code>suggest_repairs(report)</code> prints
+copy-pasteable snippets matched to the issues a report found.</li>
+<li>The join already ran and the row count is wrong.
+<code>join_explain(result, x, y, by)</code> reconstructs where the rows
+went.</li>
+<li>Two versions of a table differ and the change is unclear.
+<code>join_diff(before, after, by)</code> compares dimensions, columns,
+and key statistics.</li>
+<li>This must never happen silently again. <code>join_strict()</code>
+performs the join and errors when an expectation like
+<code>expect = &quot;1:1&quot;</code> is violated.</li>
+</ul>
+<p>The split between diagnosis and repair is deliberate.
+<code>join_spy()</code> never modifies data, and
+<code>join_repair()</code> only applies transformations that are correct
+regardless of what the keys mean: trimming, casing, stripping invisible
+characters. Anything that requires knowing the data, like the missing
+dashes of Scenario 4, stays a human decision, with the diagnostics
+pointing at it.</p>
+<p>For the wider catalogue of join failures beyond strings (duplicate
+keys multiplying rows, NA keys, accidental cartesian products), see
+<code>vignette(&quot;common-issues&quot;)</code>. For a tour of the full API on
+one worked example, see <code>vignette(&quot;quickstart&quot;)</code>. The
+string-level defects collected here are the ones that resist inspection
+longest; one diagnostic call before joining data you did not generate
+yourself covers every one of them.</p>
 </div>
 
 

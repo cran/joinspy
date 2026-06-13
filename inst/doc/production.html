@@ -12,7 +12,7 @@
 
 <meta name="author" content="Gilles Colling" />
 
-<meta name="date" content="2026-06-12" />
+<meta name="date" content="2026-06-13" />
 
 <title>Joins in Production</title>
 
@@ -341,7 +341,7 @@ code > span.er { color: #a61717; background-color: #e3d2d2; }
 
 <h1 class="title toc-ignore">Joins in Production</h1>
 <h4 class="author">Gilles Colling</h4>
-<h4 class="date">2026-06-12</h4>
+<h4 class="date">2026-06-13</h4>
 
 
 
@@ -351,10 +351,27 @@ at the output. This vignette wires joinspy into automated pipelines so
 that join problems surface as errors or log entries. Every example uses
 synthetic data and <code>tempfile()</code> paths, so the whole thing
 runs end to end.</p>
+<p>Production here means any context where nobody watches the console:
+cron jobs, CI runs, scheduled reports, Shiny back ends,
+<code>targets</code> pipelines. The failure mode is depressingly
+uniform. An upstream table gains a duplicate key or a whitespace-padded
+ID, the join silently multiplies or drops rows, and the numbers in the
+final report drift. Weeks can pass before anyone traces the drift back
+to the join, and by then the bad rows have propagated into every table
+built on top of it. The tools below convert that slow, silent failure
+into a loud, immediate one: a non-zero exit status the scheduler flags,
+a log entry a monitoring script picks up, or a failed unit test in
+CI.</p>
+<p>We work through the pieces in increasing order of machinery – hard
+assertions, silent instrumented joins, programmatic report inspection,
+cardinality guards, unit tests for join contracts, logging, multi-join
+chain analysis, and finally what all of this costs at runtime.</p>
 <div id="assertions-with-key_check" class="section level2">
 <h2>Assertions with key_check()</h2>
 <p><code>key_check()</code> returns a single logical – <code>TRUE</code>
-if no issues were detected, <code>FALSE</code> otherwise. The simplest
+if no issues were detected, <code>FALSE</code> otherwise. Behind that
+logical sit four scans: duplicate keys, NA keys, leading or trailing
+whitespace, and case mismatches between the two tables. The simplest
 assertion wraps it in <code>stopifnot()</code>:</p>
 <div class="sourceCode" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
 <span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C01&quot;</span>, <span class="st">&quot;C02&quot;</span>, <span class="st">&quot;C03&quot;</span>, <span class="st">&quot;C04&quot;</span>),</span>
@@ -370,6 +387,13 @@ assertion wraps it in <code>stopifnot()</code>:</p>
 <span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a></span>
 <span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a><span class="co"># This passes -- keys are clean</span></span>
 <span id="cb1-14"><a href="#cb1-14" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">key_check</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>))</span></code></pre></div>
+<p>An assertion this cheap can run on every execution. When it passes,
+it adds nothing to the log; when it fails, <code>stopifnot()</code>
+raises an error, the script exits with a non-zero status, and the
+scheduler marks the run as failed. That exit status is what makes the
+pattern work: cron, GitHub Actions, and Airflow all key their alerting
+off it, so a failed key check becomes a notification without any extra
+plumbing.</p>
 <p>When the keys have problems, the script halts:</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>orders_dirty <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
 <span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C01&quot;</span>, <span class="st">&quot;C02 &quot;</span>, <span class="st">&quot;C03 &quot;</span>, <span class="st">&quot;C04&quot;</span>),</span>
@@ -380,16 +404,26 @@ assertion wraps it in <code>stopifnot()</code>:</p>
 <span id="cb2-7"><a href="#cb2-7" tabindex="-1"></a><span class="fu">stopifnot</span>(<span class="fu">key_check</span>(orders_dirty, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>))</span>
 <span id="cb2-8"><a href="#cb2-8" tabindex="-1"></a><span class="co">#&gt; Error:</span></span>
 <span id="cb2-9"><a href="#cb2-9" tabindex="-1"></a><span class="co">#&gt; ! key_check(orders_dirty, customers, by = &quot;customer_id&quot;, warn = FALSE) is not TRUE</span></span></code></pre></div>
+<p>The two padded IDs (<code>&quot;C02 &quot;</code> and <code>&quot;C03 &quot;</code>)
+would silently fail to match in a left join – the rows survive, the
+customer columns come back <code>NA</code>, and downstream aggregation
+quietly treats them as customerless orders. Halting at the check, before
+the join runs, keeps the bad rows out of everything built
+afterwards.</p>
 <p>With <code>warn = FALSE</code>, the printed diagnostics are
-suppressed – in a cron job or CI pipeline, we want the script to fail
-hard rather than print warnings. An explicit
-<code>if</code>/<code>stop</code> gives us a custom error message:</p>
+suppressed; in a cron job or CI pipeline, the hard failure is the
+message. An explicit <code>if</code>/<code>stop</code> gives us a custom
+error text:</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">key_check</span>(orders_dirty, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>)) {</span>
 <span id="cb3-2"><a href="#cb3-2" tabindex="-1"></a>  <span class="fu">stop</span>(<span class="st">&quot;Key quality check failed for orders-customers join. &quot;</span>,</span>
 <span id="cb3-3"><a href="#cb3-3" tabindex="-1"></a>       <span class="st">&quot;Run join_spy() interactively for details.&quot;</span>, <span class="at">call. =</span> <span class="cn">FALSE</span>)</span>
 <span id="cb3-4"><a href="#cb3-4" tabindex="-1"></a>}</span>
 <span id="cb3-5"><a href="#cb3-5" tabindex="-1"></a><span class="co">#&gt; Error:</span></span>
 <span id="cb3-6"><a href="#cb3-6" tabindex="-1"></a><span class="co">#&gt; ! Key quality check failed for orders-customers join. Run join_spy() interactively for details.</span></span></code></pre></div>
+<p>The custom message earns its keep months later, when the error lands
+in a log file at 3 a.m. and whoever reads it has no context. Naming the
+join and pointing at <code>join_spy()</code> turns a bare
+<code>stopifnot</code> failure into a starting point for diagnosis.</p>
 <p>We can also chain the assertion with a repair step – run
 <code>key_check()</code> first, repair on failure, then re-check:</p>
 <div class="sourceCode" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>ok <span class="ot">&lt;-</span> <span class="fu">key_check</span>(orders_dirty, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>)</span>
@@ -409,12 +443,20 @@ hard rather than print warnings. An explicit
 <span id="cb4-15"><a href="#cb4-15" tabindex="-1"></a>                       <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>))</span>
 <span id="cb4-16"><a href="#cb4-16" tabindex="-1"></a>}</span>
 <span id="cb4-17"><a href="#cb4-17" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 2 value(s)</span></span></code></pre></div>
+<p><code>join_repair()</code> only touches mechanical defects – here,
+trimming whitespace and stripping invisible Unicode characters from the
+key columns. It cannot invent missing customers or decide which of two
+duplicate rows is correct, so the re-check after repair matters: if the
+second <code>key_check()</code> still fails, the problem is structural
+(true duplicates, NA keys) and the script should stop for a human.</p>
 <p><code>key_check()</code> is a binary pass/fail gate;
 <code>join_spy()</code> builds a full report with match rates, expected
-row counts, and categorized issues. In production,
-<code>key_check()</code> runs on every execution.
-<code>join_spy()</code> is what we reach for when an assertion fails and
-we need to understand why.</p>
+row counts, and categorized issues. The split mirrors how the checks
+run: <code>key_check()</code> performs the cheap scans and skips the
+heavier analyses such as near-match detection, so it stays affordable on
+every execution. In production, <code>key_check()</code> runs every
+time. <code>join_spy()</code> is what we reach for when an assertion
+fails and we need to understand why.</p>
 </div>
 <div id="silent-joins-in-pipelines" class="section level2">
 <h2>Silent Joins in Pipelines</h2>
@@ -435,12 +477,19 @@ all printed output while still computing the report internally.</p>
 <span id="cb5-12"><a href="#cb5-12" tabindex="-1"></a></span>
 <span id="cb5-13"><a href="#cb5-13" tabindex="-1"></a><span class="co"># Nothing printed</span></span>
 <span id="cb5-14"><a href="#cb5-14" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span></code></pre></div>
-<p>The report is still available via <code>last_report()</code>:</p>
+<p><code>.quiet = TRUE</code> overrides <code>verbose</code>, so it wins
+regardless of what a caller passed for <code>verbose</code>. The report
+is computed either way and stored twice: once in the package
+environment, where <code>last_report()</code> finds it, and once as an
+attribute on the returned data frame.</p>
 <div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>rpt <span class="ot">&lt;-</span> <span class="fu">last_report</span>()</span>
 <span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>rpt<span class="sc">$</span>match_analysis<span class="sc">$</span>match_rate</span>
 <span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a><span class="co">#&gt; [1] 0.75</span></span></code></pre></div>
-<p>The join runs silently; later, we pull the report and check its
-contents programmatically:</p>
+<p>The match rate is the share of unique left-table keys that found a
+partner on the right – here 3 of the 4 sensor IDs, since
+<code>S04</code> has no reading and <code>S05</code> has no sensor. The
+join runs silently; later, we pull the report and check its contents
+programmatically:</p>
 <div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>rpt <span class="ot">&lt;-</span> <span class="fu">last_report</span>()</span>
 <span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a><span class="cf">if</span> (rpt<span class="sc">$</span>match_analysis<span class="sc">$</span>match_rate <span class="sc">&lt;</span> <span class="fl">0.95</span>) {</span>
 <span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>  <span class="fu">warning</span>(<span class="fu">sprintf</span>(</span>
@@ -450,7 +499,8 @@ contents programmatically:</p>
 <span id="cb7-7"><a href="#cb7-7" tabindex="-1"></a>}</span>
 <span id="cb7-8"><a href="#cb7-8" tabindex="-1"></a><span class="co">#&gt; Warning: Low match rate (75.0%) in sensor join -- check for missing sensor IDs</span></span></code></pre></div>
 <p>The report object is a plain list, so standard R subsetting works for
-arbitrarily complex validation logic.</p>
+arbitrarily complex validation logic. Anything the printed report shows
+is reachable by name; the next section walks the full structure.</p>
 <p>One caveat: <code>last_report()</code> stores only the most recent
 report. If a script performs three joins in sequence, only the third
 report survives. To retain earlier reports, capture them explicitly:</p>
@@ -460,6 +510,115 @@ report survives. To retain earlier reports, capture them explicitly:</p>
 <span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="co"># ... later ...</span></span>
 <span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a>result2 <span class="ot">&lt;-</span> <span class="fu">inner_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
 <span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a>report2 <span class="ot">&lt;-</span> <span class="fu">last_report</span>()</span></code></pre></div>
+<p>The same report also travels with the result as an attribute, which
+sidesteps the global state entirely:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a><span class="fu">identical</span>(<span class="fu">attr</span>(result1, <span class="st">&quot;join_report&quot;</span>), report1)</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span></code></pre></div>
+<p><code>attr(result1, &quot;join_report&quot;)</code> returns the report for that
+specific join no matter how many joins ran since. Inside package code or
+functions other people call, the attribute is the safer interface;
+<code>last_report()</code> is a console convenience that happens to also
+work in scripts.</p>
+</div>
+<div id="inspecting-reports-programmatically" class="section level2">
+<h2>Inspecting Reports Programmatically</h2>
+<p>Threshold checks like the one above need to know where the numbers
+live. A <code>JoinReport</code> is an S3 object built on a named list,
+and its components map one-to-one onto the sections of the printed
+report:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>rpt <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(orders_dirty, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a><span class="fu">names</span>(rpt)</span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a><span class="co">#&gt; [1] &quot;x_summary&quot;            &quot;y_summary&quot;            &quot;match_analysis&quot;      </span></span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a><span class="co">#&gt; [4] &quot;issues&quot;               &quot;expected_rows&quot;        &quot;by&quot;                  </span></span>
+<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a><span class="co">#&gt; [7] &quot;multicolumn_analysis&quot; &quot;memory_estimate&quot;</span></span></code></pre></div>
+<p><code>x_summary</code> and <code>y_summary</code> describe the key
+columns of each table: row count (<code>n_rows</code>), unique keys
+(<code>n_unique</code>), duplicated keys (<code>n_duplicates</code>),
+rows affected by duplication (<code>n_duplicate_rows</code>), and NA
+keys (<code>n_na</code>). <code>match_analysis</code> holds the overlap:
+<code>n_matched</code>, <code>n_left_only</code>,
+<code>n_right_only</code>, and <code>match_rate</code>.
+<code>expected_rows</code> predicts the row count for each join type
+(<code>inner</code>, <code>left</code>, <code>right</code>,
+<code>full</code>), and <code>issues</code> is a list with one entry per
+detected problem. Of the remaining components, <code>by</code> records
+the key, <code>multicolumn_analysis</code> scores each column of a
+composite key separately, and <code>memory_estimate</code> holds
+human-readable result-size estimates per join type.</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a>rpt<span class="sc">$</span>x_summary<span class="sc">$</span>n_duplicates</span>
+<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a><span class="co">#&gt; [1] 0</span></span>
+<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>rpt<span class="sc">$</span>match_analysis<span class="sc">$</span>match_rate</span>
+<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a><span class="co">#&gt; [1] 0.5</span></span>
+<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a>rpt<span class="sc">$</span>expected_rows<span class="sc">$</span>left</span>
+<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a><span class="co">#&gt; [1] 4</span></span></code></pre></div>
+<p>The padded IDs cut the match rate to 50% even though neither table
+has a single duplicate. For alerting, three numbers cover most needs:
+the match rate, the issue count, and the expected row count for the join
+type about to run.</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a><span class="fu">length</span>(rpt<span class="sc">$</span>issues)</span>
+<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a><span class="co">#&gt; [1] 2</span></span>
+<span id="cb12-3"><a href="#cb12-3" tabindex="-1"></a><span class="fu">vapply</span>(rpt<span class="sc">$</span>issues, <span class="cf">function</span>(i) i<span class="sc">$</span>type, <span class="fu">character</span>(<span class="dv">1</span>))</span>
+<span id="cb12-4"><a href="#cb12-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;whitespace&quot; &quot;near_match&quot;</span></span></code></pre></div>
+<p>Each issue is itself a list with a <code>type</code>, a
+<code>severity</code> (<code>&quot;error&quot;</code>, <code>&quot;warning&quot;</code>, or
+<code>&quot;info&quot;</code>), a human-readable <code>message</code>, and usually
+a <code>details</code> element holding the offending values. Filtering
+on severity separates problems that should halt a pipeline from
+observations that belong in a log:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a>severities <span class="ot">&lt;-</span> <span class="fu">vapply</span>(rpt<span class="sc">$</span>issues, <span class="cf">function</span>(i) i<span class="sc">$</span>severity, <span class="fu">character</span>(<span class="dv">1</span>))</span>
+<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a>severities</span>
+<span id="cb13-3"><a href="#cb13-3" tabindex="-1"></a><span class="co">#&gt; [1] &quot;warning&quot; &quot;info&quot;</span></span>
+<span id="cb13-4"><a href="#cb13-4" tabindex="-1"></a><span class="fu">sum</span>(severities <span class="sc">==</span> <span class="st">&quot;warning&quot;</span>)</span>
+<span id="cb13-5"><a href="#cb13-5" tabindex="-1"></a><span class="co">#&gt; [1] 1</span></span></code></pre></div>
+<p>Here the whitespace issue carries <code>&quot;warning&quot;</code> severity
+while the near-match hint is merely <code>&quot;info&quot;</code>. Wrapping the
+thresholds in a function gives the pipeline a single reusable gate:</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a>report_gate <span class="ot">&lt;-</span> <span class="cf">function</span>(rpt, <span class="at">min_match =</span> <span class="fl">0.95</span>) {</span>
+<span id="cb14-2"><a href="#cb14-2" tabindex="-1"></a>  <span class="fu">stopifnot</span>(<span class="fu">is_join_report</span>(rpt))</span>
+<span id="cb14-3"><a href="#cb14-3" tabindex="-1"></a>  problems <span class="ot">&lt;-</span> <span class="fu">character</span>(<span class="dv">0</span>)</span>
+<span id="cb14-4"><a href="#cb14-4" tabindex="-1"></a>  <span class="cf">if</span> (rpt<span class="sc">$</span>match_analysis<span class="sc">$</span>match_rate <span class="sc">&lt;</span> min_match) {</span>
+<span id="cb14-5"><a href="#cb14-5" tabindex="-1"></a>    problems <span class="ot">&lt;-</span> <span class="fu">c</span>(problems, <span class="fu">sprintf</span>(</span>
+<span id="cb14-6"><a href="#cb14-6" tabindex="-1"></a>      <span class="st">&quot;match rate %.0f%% below %.0f%%&quot;</span>,</span>
+<span id="cb14-7"><a href="#cb14-7" tabindex="-1"></a>      <span class="dv">100</span> <span class="sc">*</span> rpt<span class="sc">$</span>match_analysis<span class="sc">$</span>match_rate, <span class="dv">100</span> <span class="sc">*</span> min_match</span>
+<span id="cb14-8"><a href="#cb14-8" tabindex="-1"></a>    ))</span>
+<span id="cb14-9"><a href="#cb14-9" tabindex="-1"></a>  }</span>
+<span id="cb14-10"><a href="#cb14-10" tabindex="-1"></a>  sev <span class="ot">&lt;-</span> <span class="fu">vapply</span>(rpt<span class="sc">$</span>issues, <span class="cf">function</span>(i) i<span class="sc">$</span>severity, <span class="fu">character</span>(<span class="dv">1</span>))</span>
+<span id="cb14-11"><a href="#cb14-11" tabindex="-1"></a>  <span class="cf">if</span> (<span class="fu">any</span>(sev <span class="sc">==</span> <span class="st">&quot;warning&quot;</span>)) {</span>
+<span id="cb14-12"><a href="#cb14-12" tabindex="-1"></a>    problems <span class="ot">&lt;-</span> <span class="fu">c</span>(problems, <span class="fu">sprintf</span>(<span class="st">&quot;%d warning-level issue(s)&quot;</span>,</span>
+<span id="cb14-13"><a href="#cb14-13" tabindex="-1"></a>                                    <span class="fu">sum</span>(sev <span class="sc">==</span> <span class="st">&quot;warning&quot;</span>)))</span>
+<span id="cb14-14"><a href="#cb14-14" tabindex="-1"></a>  }</span>
+<span id="cb14-15"><a href="#cb14-15" tabindex="-1"></a>  problems</span>
+<span id="cb14-16"><a href="#cb14-16" tabindex="-1"></a>}</span>
+<span id="cb14-17"><a href="#cb14-17" tabindex="-1"></a></span>
+<span id="cb14-18"><a href="#cb14-18" tabindex="-1"></a><span class="fu">report_gate</span>(rpt)</span>
+<span id="cb14-19"><a href="#cb14-19" tabindex="-1"></a><span class="co">#&gt; [1] &quot;match rate 50% below 95%&quot; &quot;1 warning-level issue(s)&quot;</span></span></code></pre></div>
+<p><code>is_join_report()</code> guards the entry point.
+<code>last_report()</code> returns <code>NULL</code> before any join has
+run, and a half-wired pipeline will happily pass that <code>NULL</code>
+along; failing on the class check localizes the bug to the gate’s
+caller. The returned character vector doubles as the alert body – empty
+means healthy, anything else is the text of the page.</p>
+<p>For metric collection, <code>summary()</code> flattens the same
+numbers into a two-column data frame:</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a><span class="fu">summary</span>(rpt)</span>
+<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a><span class="co">#&gt;               metric value</span></span>
+<span id="cb15-3"><a href="#cb15-3" tabindex="-1"></a><span class="co">#&gt; 1          left_rows   4.0</span></span>
+<span id="cb15-4"><a href="#cb15-4" tabindex="-1"></a><span class="co">#&gt; 2         right_rows   4.0</span></span>
+<span id="cb15-5"><a href="#cb15-5" tabindex="-1"></a><span class="co">#&gt; 3   left_unique_keys   4.0</span></span>
+<span id="cb15-6"><a href="#cb15-6" tabindex="-1"></a><span class="co">#&gt; 4  right_unique_keys   4.0</span></span>
+<span id="cb15-7"><a href="#cb15-7" tabindex="-1"></a><span class="co">#&gt; 5       keys_matched   2.0</span></span>
+<span id="cb15-8"><a href="#cb15-8" tabindex="-1"></a><span class="co">#&gt; 6     keys_left_only   2.0</span></span>
+<span id="cb15-9"><a href="#cb15-9" tabindex="-1"></a><span class="co">#&gt; 7    keys_right_only   2.0</span></span>
+<span id="cb15-10"><a href="#cb15-10" tabindex="-1"></a><span class="co">#&gt; 8         match_rate   0.5</span></span>
+<span id="cb15-11"><a href="#cb15-11" tabindex="-1"></a><span class="co">#&gt; 9             issues   2.0</span></span>
+<span id="cb15-12"><a href="#cb15-12" tabindex="-1"></a><span class="co">#&gt; 10   inner_join_rows   2.0</span></span>
+<span id="cb15-13"><a href="#cb15-13" tabindex="-1"></a><span class="co">#&gt; 11    left_join_rows   4.0</span></span>
+<span id="cb15-14"><a href="#cb15-14" tabindex="-1"></a><span class="co">#&gt; 12   right_join_rows   4.0</span></span>
+<span id="cb15-15"><a href="#cb15-15" tabindex="-1"></a><span class="co">#&gt; 13    full_join_rows   6.0</span></span></code></pre></div>
+<p>That shape suits accumulating one row of metrics per pipeline run or
+writing into a database table;
+<code>summary(rpt, format = &quot;markdown&quot;)</code> produces a table for
+inclusion in a rendered report.</p>
 </div>
 <div id="cardinality-guards" class="section level2">
 <h2>Cardinality Guards</h2>
@@ -469,49 +628,60 @@ enforces a cardinality constraint and throws an error if it is
 violated.</p>
 <p>In development, we use <code>detect_cardinality()</code> to
 understand the actual relationship:</p>
-<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>products <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P2&quot;</span>, <span class="st">&quot;P3&quot;</span>),</span>
-<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Gadget&quot;</span>, <span class="st">&quot;Gizmo&quot;</span>),</span>
-<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a>)</span>
-<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a></span>
-<span id="cb9-7"><a href="#cb9-7" tabindex="-1"></a>line_items <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb9-8"><a href="#cb9-8" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P2&quot;</span>, <span class="st">&quot;P3&quot;</span>, <span class="st">&quot;P3&quot;</span>),</span>
-<span id="cb9-9"><a href="#cb9-9" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="fu">c</span>(<span class="dv">101</span>, <span class="dv">102</span>, <span class="dv">103</span>, <span class="dv">104</span>, <span class="dv">105</span>),</span>
-<span id="cb9-10"><a href="#cb9-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb9-11"><a href="#cb9-11" tabindex="-1"></a>)</span>
-<span id="cb9-12"><a href="#cb9-12" tabindex="-1"></a></span>
-<span id="cb9-13"><a href="#cb9-13" tabindex="-1"></a><span class="fu">detect_cardinality</span>(products, line_items, <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>)</span>
-<span id="cb9-14"><a href="#cb9-14" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;1:n&quot;</span></span>
-<span id="cb9-15"><a href="#cb9-15" tabindex="-1"></a><span class="co">#&gt; Right duplicates: 2 key(s)</span></span></code></pre></div>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a>products <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb16-2"><a href="#cb16-2" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P2&quot;</span>, <span class="st">&quot;P3&quot;</span>),</span>
+<span id="cb16-3"><a href="#cb16-3" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Gadget&quot;</span>, <span class="st">&quot;Gizmo&quot;</span>),</span>
+<span id="cb16-4"><a href="#cb16-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb16-5"><a href="#cb16-5" tabindex="-1"></a>)</span>
+<span id="cb16-6"><a href="#cb16-6" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" tabindex="-1"></a>line_items <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb16-8"><a href="#cb16-8" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P2&quot;</span>, <span class="st">&quot;P3&quot;</span>, <span class="st">&quot;P3&quot;</span>),</span>
+<span id="cb16-9"><a href="#cb16-9" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="fu">c</span>(<span class="dv">101</span>, <span class="dv">102</span>, <span class="dv">103</span>, <span class="dv">104</span>, <span class="dv">105</span>),</span>
+<span id="cb16-10"><a href="#cb16-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb16-11"><a href="#cb16-11" tabindex="-1"></a>)</span>
+<span id="cb16-12"><a href="#cb16-12" tabindex="-1"></a></span>
+<span id="cb16-13"><a href="#cb16-13" tabindex="-1"></a><span class="fu">detect_cardinality</span>(products, line_items, <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>)</span>
+<span id="cb16-14"><a href="#cb16-14" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;1:n&quot;</span></span>
+<span id="cb16-15"><a href="#cb16-15" tabindex="-1"></a><span class="co">#&gt; Right duplicates: 2 key(s)</span></span></code></pre></div>
 <p>One-to-many: each product appears once in <code>products</code> but
-can appear multiple times in <code>line_items</code>. We encode that
+can appear multiple times in <code>line_items</code>.
+<code>detect_cardinality()</code> prints its finding and returns the
+string invisibly, so the same call works interactively and as a value in
+a gate (<code>card &lt;- detect_cardinality(...)</code>). We encode the
 expectation in production:</p>
-<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">join_strict</span>(</span>
-<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>  products, line_items,</span>
-<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>  <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>,</span>
-<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a>  <span class="at">type =</span> <span class="st">&quot;left&quot;</span>,</span>
-<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a>  <span class="at">expect =</span> <span class="st">&quot;1:n&quot;</span></span>
-<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a>)</span>
-<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
-<span id="cb10-8"><a href="#cb10-8" tabindex="-1"></a><span class="co">#&gt; [1] 5</span></span></code></pre></div>
+<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">join_strict</span>(</span>
+<span id="cb17-2"><a href="#cb17-2" tabindex="-1"></a>  products, line_items,</span>
+<span id="cb17-3"><a href="#cb17-3" tabindex="-1"></a>  <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>,</span>
+<span id="cb17-4"><a href="#cb17-4" tabindex="-1"></a>  <span class="at">type =</span> <span class="st">&quot;left&quot;</span>,</span>
+<span id="cb17-5"><a href="#cb17-5" tabindex="-1"></a>  <span class="at">expect =</span> <span class="st">&quot;1:n&quot;</span></span>
+<span id="cb17-6"><a href="#cb17-6" tabindex="-1"></a>)</span>
+<span id="cb17-7"><a href="#cb17-7" tabindex="-1"></a><span class="fu">nrow</span>(result)</span>
+<span id="cb17-8"><a href="#cb17-8" tabindex="-1"></a><span class="co">#&gt; [1] 5</span></span></code></pre></div>
 <p>If someone loads a <code>products</code> table with duplicate product
 IDs, the script fails immediately:</p>
-<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a>products_bad <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P2&quot;</span>, <span class="st">&quot;P3&quot;</span>),</span>
-<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Widget v2&quot;</span>, <span class="st">&quot;Gadget&quot;</span>, <span class="st">&quot;Gizmo&quot;</span>),</span>
-<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb11-5"><a href="#cb11-5" tabindex="-1"></a>)</span>
-<span id="cb11-6"><a href="#cb11-6" tabindex="-1"></a></span>
-<span id="cb11-7"><a href="#cb11-7" tabindex="-1"></a><span class="fu">join_strict</span>(</span>
-<span id="cb11-8"><a href="#cb11-8" tabindex="-1"></a>  products_bad, line_items,</span>
-<span id="cb11-9"><a href="#cb11-9" tabindex="-1"></a>  <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>,</span>
-<span id="cb11-10"><a href="#cb11-10" tabindex="-1"></a>  <span class="at">type =</span> <span class="st">&quot;left&quot;</span>,</span>
-<span id="cb11-11"><a href="#cb11-11" tabindex="-1"></a>  <span class="at">expect =</span> <span class="st">&quot;1:n&quot;</span></span>
-<span id="cb11-12"><a href="#cb11-12" tabindex="-1"></a>)</span>
-<span id="cb11-13"><a href="#cb11-13" tabindex="-1"></a><span class="co">#&gt; Error in `join_strict()`:</span></span>
-<span id="cb11-14"><a href="#cb11-14" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected &quot;1:n&quot; but found &quot;n:m&quot;.</span></span>
-<span id="cb11-15"><a href="#cb11-15" tabindex="-1"></a><span class="co">#&gt; ℹ Left duplicates: 1, right duplicates: 2.</span></span></code></pre></div>
+<div class="sourceCode" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" tabindex="-1"></a>products_bad <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb18-2"><a href="#cb18-2" tabindex="-1"></a>  <span class="at">product_id =</span> <span class="fu">c</span>(<span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P1&quot;</span>, <span class="st">&quot;P2&quot;</span>, <span class="st">&quot;P3&quot;</span>),</span>
+<span id="cb18-3"><a href="#cb18-3" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Widget&quot;</span>, <span class="st">&quot;Widget v2&quot;</span>, <span class="st">&quot;Gadget&quot;</span>, <span class="st">&quot;Gizmo&quot;</span>),</span>
+<span id="cb18-4"><a href="#cb18-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb18-5"><a href="#cb18-5" tabindex="-1"></a>)</span>
+<span id="cb18-6"><a href="#cb18-6" tabindex="-1"></a></span>
+<span id="cb18-7"><a href="#cb18-7" tabindex="-1"></a><span class="fu">join_strict</span>(</span>
+<span id="cb18-8"><a href="#cb18-8" tabindex="-1"></a>  products_bad, line_items,</span>
+<span id="cb18-9"><a href="#cb18-9" tabindex="-1"></a>  <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>,</span>
+<span id="cb18-10"><a href="#cb18-10" tabindex="-1"></a>  <span class="at">type =</span> <span class="st">&quot;left&quot;</span>,</span>
+<span id="cb18-11"><a href="#cb18-11" tabindex="-1"></a>  <span class="at">expect =</span> <span class="st">&quot;1:n&quot;</span></span>
+<span id="cb18-12"><a href="#cb18-12" tabindex="-1"></a>)</span>
+<span id="cb18-13"><a href="#cb18-13" tabindex="-1"></a><span class="co">#&gt; Error in `join_strict()`:</span></span>
+<span id="cb18-14"><a href="#cb18-14" tabindex="-1"></a><span class="co">#&gt; ! Cardinality violation: expected &quot;1:n&quot; but found &quot;n:m&quot;.</span></span>
+<span id="cb18-15"><a href="#cb18-15" tabindex="-1"></a><span class="co">#&gt; ℹ Left duplicates: 1, right duplicates: 2.</span></span></code></pre></div>
+<p>This is the classic slow failure made fast. A reference table that
+was clean for two years gains its first duplicate – a vendor file gets
+loaded twice, or a re-run ETL step appends a second copy – and every
+downstream left join starts multiplying rows. Without the guard, the
+symptom is inflated totals in a report some weeks later; with it, the
+run fails the same night, and the error message carries the cause: the
+expected cardinality, the one actually found, and the duplicate counts
+on each side.</p>
 <p>The four cardinality levels:</p>
 <ul>
 <li><p><strong>1:1</strong> – lookup to lookup. Each key appears exactly
@@ -535,94 +705,179 @@ without triggering a Cartesian explosion (one extra duplicate is
 enough), and a <code>&quot;n:m&quot;</code> join can produce a massive product
 that <code>join_strict()</code> would allow. The two functions
 complement each other.</p>
+<div class="sourceCode" id="cb19"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb19-1"><a href="#cb19-1" tabindex="-1"></a>events_a <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">rep</span>(<span class="fu">c</span>(<span class="st">&quot;E1&quot;</span>, <span class="st">&quot;E2&quot;</span>), <span class="at">each =</span> <span class="dv">20</span>), <span class="at">src =</span> <span class="st">&quot;a&quot;</span>,</span>
+<span id="cb19-2"><a href="#cb19-2" tabindex="-1"></a>                       <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb19-3"><a href="#cb19-3" tabindex="-1"></a>events_b <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(<span class="at">id =</span> <span class="fu">rep</span>(<span class="fu">c</span>(<span class="st">&quot;E1&quot;</span>, <span class="st">&quot;E2&quot;</span>), <span class="at">each =</span> <span class="dv">20</span>), <span class="at">src =</span> <span class="st">&quot;b&quot;</span>,</span>
+<span id="cb19-4"><a href="#cb19-4" tabindex="-1"></a>                       <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb19-5"><a href="#cb19-5" tabindex="-1"></a></span>
+<span id="cb19-6"><a href="#cb19-6" tabindex="-1"></a>chk <span class="ot">&lt;-</span> <span class="fu">check_cartesian</span>(events_a, events_b, <span class="at">by =</span> <span class="st">&quot;id&quot;</span>)</span>
+<span id="cb19-7"><a href="#cb19-7" tabindex="-1"></a><span class="co">#&gt; ✖ Cartesian product risk: result will be 20x larger than input</span></span>
+<span id="cb19-8"><a href="#cb19-8" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb19-9"><a href="#cb19-9" tabindex="-1"></a><span class="co">#&gt; ── Worst offending keys ──</span></span>
+<span id="cb19-10"><a href="#cb19-10" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb19-11"><a href="#cb19-11" tabindex="-1"></a><span class="co">#&gt; &quot;E1&quot;: 20 x 20 = 400 rows</span></span>
+<span id="cb19-12"><a href="#cb19-12" tabindex="-1"></a><span class="co">#&gt; &quot;E2&quot;: 20 x 20 = 400 rows</span></span>
+<span id="cb19-13"><a href="#cb19-13" tabindex="-1"></a>chk<span class="sc">$</span>expansion_factor</span>
+<span id="cb19-14"><a href="#cb19-14" tabindex="-1"></a><span class="co">#&gt; [1] 20</span></span></code></pre></div>
+<p>The return value is a list with <code>has_explosion</code>, the
+<code>expansion_factor</code>, the predicted <code>total_inner</code>
+row count, and a <code>worst_keys</code> data frame naming the keys
+responsible. As a pipeline gate,
+<code>if (chk$has_explosion) stop(...)</code> catches the blow-up before
+the join allocates the memory. The 20x factor here turns a 40-row input
+into an 800-row result; the same arithmetic on a million-row table is
+what fills a server’s RAM at 2 a.m.</p>
+</div>
+<div id="testing-join-contracts-with-testthat" class="section level2">
+<h2>Testing Join Contracts with testthat</h2>
+<p>The gates so far run when the pipeline runs. A second line of defense
+runs when the code changes: unit tests that pin down the join contracts
+– which columns join which tables, at what cardinality, with what key
+quality. These contracts rarely appear in documentation; they live in
+the heads of whoever wrote the pipeline. Encoding them as testthat
+expectations lets them survive refactors and staff turnover.</p>
+<p>Since <code>key_check()</code> returns a logical and
+<code>detect_cardinality()</code> returns a string, both drop straight
+into expectations:</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" tabindex="-1"></a><span class="fu">library</span>(testthat)</span>
+<span id="cb20-2"><a href="#cb20-2" tabindex="-1"></a></span>
+<span id="cb20-3"><a href="#cb20-3" tabindex="-1"></a><span class="fu">test_that</span>(<span class="st">&quot;orders join customers cleanly on customer_id&quot;</span>, {</span>
+<span id="cb20-4"><a href="#cb20-4" tabindex="-1"></a>  <span class="fu">expect_true</span>(<span class="fu">key_check</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>))</span>
+<span id="cb20-5"><a href="#cb20-5" tabindex="-1"></a>})</span>
+<span id="cb20-6"><a href="#cb20-6" tabindex="-1"></a><span class="co">#&gt; Test passed with 1 success 🌈.</span></span></code></pre></div>
+<div class="sourceCode" id="cb21"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb21-1"><a href="#cb21-1" tabindex="-1"></a><span class="fu">test_that</span>(<span class="st">&quot;products to line_items is one-to-many&quot;</span>, {</span>
+<span id="cb21-2"><a href="#cb21-2" tabindex="-1"></a>  <span class="fu">expect_identical</span>(</span>
+<span id="cb21-3"><a href="#cb21-3" tabindex="-1"></a>    <span class="fu">detect_cardinality</span>(products, line_items, <span class="at">by =</span> <span class="st">&quot;product_id&quot;</span>),</span>
+<span id="cb21-4"><a href="#cb21-4" tabindex="-1"></a>    <span class="st">&quot;1:n&quot;</span></span>
+<span id="cb21-5"><a href="#cb21-5" tabindex="-1"></a>  )</span>
+<span id="cb21-6"><a href="#cb21-6" tabindex="-1"></a>})</span>
+<span id="cb21-7"><a href="#cb21-7" tabindex="-1"></a><span class="co">#&gt; i Detected cardinality: &quot;1:n&quot;</span></span>
+<span id="cb21-8"><a href="#cb21-8" tabindex="-1"></a><span class="co">#&gt; Right duplicates: 2 key(s)</span></span>
+<span id="cb21-9"><a href="#cb21-9" tabindex="-1"></a><span class="co">#&gt; Test passed with 1 success 🌈.</span></span></code></pre></div>
+<p>The cardinality test is the one that pays off. Cardinality violations
+come from data, and data changes without commits; running this test
+against a fresh extract in CI, or on a schedule, catches the first
+duplicate product before the nightly join multiplies line items. A third
+useful contract is row preservation, written against the prediction in
+the report:</p>
+<div class="sourceCode" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" tabindex="-1"></a><span class="fu">test_that</span>(<span class="st">&quot;left join is predicted to preserve order rows&quot;</span>, {</span>
+<span id="cb22-2"><a href="#cb22-2" tabindex="-1"></a>  rpt <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb22-3"><a href="#cb22-3" tabindex="-1"></a>  <span class="fu">expect_equal</span>(rpt<span class="sc">$</span>expected_rows<span class="sc">$</span>left, <span class="fu">nrow</span>(orders))</span>
+<span id="cb22-4"><a href="#cb22-4" tabindex="-1"></a>})</span>
+<span id="cb22-5"><a href="#cb22-5" tabindex="-1"></a><span class="co">#&gt; Test passed with 1 success 😸.</span></span></code></pre></div>
+<p><code>expected_rows$left</code> equals <code>nrow(orders)</code>
+exactly when no left key matches a duplicated right key, so this single
+expectation encodes “the enrichment join does not multiply rows” without
+running the join. In a package or pipeline repository these tests live
+in <code>tests/testthat/test-join-contracts.R</code> and run with
+everything else under <code>testthat::test_dir()</code> or
+<code>R CMD check</code>. What data they point at is the design
+decision: against committed fixture files they test the code’s
+assumptions; against a small fresh extract they test the data itself,
+which makes them a scheduled data-quality job wearing a unit-test
+interface.</p>
 </div>
 <div id="logging-and-audit-trails" class="section level2">
 <h2>Logging and Audit Trails</h2>
 <div id="manual-logging" class="section level3">
 <h3>Manual logging</h3>
 <p><code>log_report()</code> writes a single report to a file. The
-format depends on the file extension:</p>
-<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>)</span>
-<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a></span>
-<span id="cb12-3"><a href="#cb12-3" tabindex="-1"></a><span class="co"># Text format -- human-readable</span></span>
-<span id="cb12-4"><a href="#cb12-4" tabindex="-1"></a>txt_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
-<span id="cb12-5"><a href="#cb12-5" tabindex="-1"></a><span class="fu">log_report</span>(report, txt_log)</span>
-<span id="cb12-6"><a href="#cb12-6" tabindex="-1"></a><span class="co">#&gt; ✔ Report logged to &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpSoloDX\file427c3c59b91.log&#39;</span></span>
-<span id="cb12-7"><a href="#cb12-7" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">readLines</span>(txt_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
-<span id="cb12-8"><a href="#cb12-8" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-12 23:19:27</span></span>
-<span id="cb12-9"><a href="#cb12-9" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
-<span id="cb12-10"><a href="#cb12-10" tabindex="-1"></a><span class="co">#&gt; Join Key: sensor_id</span></span>
-<span id="cb12-11"><a href="#cb12-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb12-12"><a href="#cb12-12" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
-<span id="cb12-13"><a href="#cb12-13" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
-<span id="cb12-14"><a href="#cb12-14" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
-<span id="cb12-15"><a href="#cb12-15" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb12-16"><a href="#cb12-16" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb12-17"><a href="#cb12-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb12-18"><a href="#cb12-18" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
-<span id="cb12-19"><a href="#cb12-19" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
-<span id="cb12-20"><a href="#cb12-20" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
-<span id="cb12-21"><a href="#cb12-21" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb12-22"><a href="#cb12-22" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb12-23"><a href="#cb12-23" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb12-24"><a href="#cb12-24" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
-<span id="cb12-25"><a href="#cb12-25" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 3</span></span>
-<span id="cb12-26"><a href="#cb12-26" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 1</span></span>
-<span id="cb12-27"><a href="#cb12-27" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
-<span id="cb12-28"><a href="#cb12-28" tabindex="-1"></a><span class="co">#&gt;   Match rate: 75%</span></span>
-<span id="cb12-29"><a href="#cb12-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb12-30"><a href="#cb12-30" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
-<span id="cb12-31"><a href="#cb12-31" tabindex="-1"></a><span class="co">#&gt;   inner_join: 3</span></span>
-<span id="cb12-32"><a href="#cb12-32" tabindex="-1"></a><span class="co">#&gt;   left_join: 4</span></span>
-<span id="cb12-33"><a href="#cb12-33" tabindex="-1"></a><span class="co">#&gt;   right_join: 4</span></span>
-<span id="cb12-34"><a href="#cb12-34" tabindex="-1"></a><span class="co">#&gt;   full_join: 5</span></span>
-<span id="cb12-35"><a href="#cb12-35" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb12-36"><a href="#cb12-36" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
-<span id="cb12-37"><a href="#cb12-37" tabindex="-1"></a><span class="co">#&gt;   near_match: 1</span></span>
-<span id="cb12-38"><a href="#cb12-38" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
-<span id="cb12-39"><a href="#cb12-39" tabindex="-1"></a><span class="fu">unlink</span>(txt_log)</span></code></pre></div>
-<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a><span class="co"># JSON format -- machine-readable</span></span>
-<span id="cb13-2"><a href="#cb13-2" tabindex="-1"></a>json_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.json&quot;</span>)</span>
-<span id="cb13-3"><a href="#cb13-3" tabindex="-1"></a><span class="fu">log_report</span>(report, json_log)</span>
-<span id="cb13-4"><a href="#cb13-4" tabindex="-1"></a><span class="co">#&gt; ✔ Report logged to &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpSoloDX\file427c2c5c24e0.json&#39;</span></span>
-<span id="cb13-5"><a href="#cb13-5" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">readLines</span>(json_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
-<span id="cb13-6"><a href="#cb13-6" tabindex="-1"></a><span class="co">#&gt; {</span></span>
-<span id="cb13-7"><a href="#cb13-7" tabindex="-1"></a><span class="co">#&gt;   &quot;by&quot;: &quot;sensor_id&quot;,</span></span>
-<span id="cb13-8"><a href="#cb13-8" tabindex="-1"></a><span class="co">#&gt;   &quot;x_summary&quot;: {</span></span>
-<span id="cb13-9"><a href="#cb13-9" tabindex="-1"></a><span class="co">#&gt;   &quot;n_rows&quot;: 4,</span></span>
-<span id="cb13-10"><a href="#cb13-10" tabindex="-1"></a><span class="co">#&gt;   &quot;n_unique&quot;: 4,</span></span>
-<span id="cb13-11"><a href="#cb13-11" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicates&quot;: 0,</span></span>
-<span id="cb13-12"><a href="#cb13-12" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicate_rows&quot;: 0,</span></span>
-<span id="cb13-13"><a href="#cb13-13" tabindex="-1"></a><span class="co">#&gt;   &quot;n_na&quot;: 0</span></span>
-<span id="cb13-14"><a href="#cb13-14" tabindex="-1"></a><span class="co">#&gt; },</span></span>
-<span id="cb13-15"><a href="#cb13-15" tabindex="-1"></a><span class="co">#&gt;   &quot;y_summary&quot;: {</span></span>
-<span id="cb13-16"><a href="#cb13-16" tabindex="-1"></a><span class="co">#&gt;   &quot;n_rows&quot;: 4,</span></span>
-<span id="cb13-17"><a href="#cb13-17" tabindex="-1"></a><span class="co">#&gt;   &quot;n_unique&quot;: 4,</span></span>
-<span id="cb13-18"><a href="#cb13-18" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicates&quot;: 0,</span></span>
-<span id="cb13-19"><a href="#cb13-19" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicate_rows&quot;: 0,</span></span>
-<span id="cb13-20"><a href="#cb13-20" tabindex="-1"></a><span class="co">#&gt;   &quot;n_na&quot;: 0</span></span>
-<span id="cb13-21"><a href="#cb13-21" tabindex="-1"></a><span class="co">#&gt; },</span></span>
-<span id="cb13-22"><a href="#cb13-22" tabindex="-1"></a><span class="co">#&gt;   &quot;match_analysis&quot;: {</span></span>
-<span id="cb13-23"><a href="#cb13-23" tabindex="-1"></a><span class="co">#&gt;   &quot;n_matched&quot;: 3,</span></span>
-<span id="cb13-24"><a href="#cb13-24" tabindex="-1"></a><span class="co">#&gt;   &quot;n_left_only&quot;: 1,</span></span>
-<span id="cb13-25"><a href="#cb13-25" tabindex="-1"></a><span class="co">#&gt;   &quot;n_right_only&quot;: 1,</span></span>
-<span id="cb13-26"><a href="#cb13-26" tabindex="-1"></a><span class="co">#&gt;   &quot;match_rate&quot;: 0.75</span></span>
-<span id="cb13-27"><a href="#cb13-27" tabindex="-1"></a><span class="co">#&gt; },</span></span>
-<span id="cb13-28"><a href="#cb13-28" tabindex="-1"></a><span class="co">#&gt;   &quot;expected_rows&quot;: {</span></span>
-<span id="cb13-29"><a href="#cb13-29" tabindex="-1"></a><span class="co">#&gt;   &quot;inner&quot;: 3,</span></span>
-<span id="cb13-30"><a href="#cb13-30" tabindex="-1"></a><span class="co">#&gt;   &quot;left&quot;: 4,</span></span>
-<span id="cb13-31"><a href="#cb13-31" tabindex="-1"></a><span class="co">#&gt;   &quot;right&quot;: 4,</span></span>
-<span id="cb13-32"><a href="#cb13-32" tabindex="-1"></a><span class="co">#&gt;   &quot;full&quot;: 5</span></span>
-<span id="cb13-33"><a href="#cb13-33" tabindex="-1"></a><span class="co">#&gt; },</span></span>
-<span id="cb13-34"><a href="#cb13-34" tabindex="-1"></a><span class="co">#&gt;   &quot;n_issues&quot;: 1,</span></span>
-<span id="cb13-35"><a href="#cb13-35" tabindex="-1"></a><span class="co">#&gt;   &quot;issue_types&quot;: &quot;near_match&quot;,</span></span>
-<span id="cb13-36"><a href="#cb13-36" tabindex="-1"></a><span class="co">#&gt;   &quot;logged_at&quot;: &quot;2026-06-12 23:19:27&quot;</span></span>
-<span id="cb13-37"><a href="#cb13-37" tabindex="-1"></a><span class="co">#&gt; }</span></span>
-<span id="cb13-38"><a href="#cb13-38" tabindex="-1"></a><span class="fu">unlink</span>(json_log)</span></code></pre></div>
+format depends on the file extension: <code>.txt</code> and
+<code>.log</code> produce human-readable text, <code>.json</code>
+produces machine-readable JSON, and <code>.rds</code> saves the complete
+R object.</p>
+<div class="sourceCode" id="cb23"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb23-1"><a href="#cb23-1" tabindex="-1"></a>report <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>)</span>
+<span id="cb23-2"><a href="#cb23-2" tabindex="-1"></a></span>
+<span id="cb23-3"><a href="#cb23-3" tabindex="-1"></a><span class="co"># Text format -- human-readable</span></span>
+<span id="cb23-4"><a href="#cb23-4" tabindex="-1"></a>txt_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
+<span id="cb23-5"><a href="#cb23-5" tabindex="-1"></a><span class="fu">log_report</span>(report, txt_log)</span>
+<span id="cb23-6"><a href="#cb23-6" tabindex="-1"></a><span class="co">#&gt; ✔ Report logged to &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpGsFaTd\fileac2814163999.log&#39;</span></span>
+<span id="cb23-7"><a href="#cb23-7" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">readLines</span>(txt_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
+<span id="cb23-8"><a href="#cb23-8" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-13 01:39:39</span></span>
+<span id="cb23-9"><a href="#cb23-9" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
+<span id="cb23-10"><a href="#cb23-10" tabindex="-1"></a><span class="co">#&gt; Join Key: sensor_id</span></span>
+<span id="cb23-11"><a href="#cb23-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb23-12"><a href="#cb23-12" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
+<span id="cb23-13"><a href="#cb23-13" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
+<span id="cb23-14"><a href="#cb23-14" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
+<span id="cb23-15"><a href="#cb23-15" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb23-16"><a href="#cb23-16" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb23-17"><a href="#cb23-17" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb23-18"><a href="#cb23-18" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
+<span id="cb23-19"><a href="#cb23-19" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
+<span id="cb23-20"><a href="#cb23-20" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
+<span id="cb23-21"><a href="#cb23-21" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb23-22"><a href="#cb23-22" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb23-23"><a href="#cb23-23" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb23-24"><a href="#cb23-24" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
+<span id="cb23-25"><a href="#cb23-25" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 3</span></span>
+<span id="cb23-26"><a href="#cb23-26" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 1</span></span>
+<span id="cb23-27"><a href="#cb23-27" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
+<span id="cb23-28"><a href="#cb23-28" tabindex="-1"></a><span class="co">#&gt;   Match rate: 75%</span></span>
+<span id="cb23-29"><a href="#cb23-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb23-30"><a href="#cb23-30" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
+<span id="cb23-31"><a href="#cb23-31" tabindex="-1"></a><span class="co">#&gt;   inner_join: 3</span></span>
+<span id="cb23-32"><a href="#cb23-32" tabindex="-1"></a><span class="co">#&gt;   left_join: 4</span></span>
+<span id="cb23-33"><a href="#cb23-33" tabindex="-1"></a><span class="co">#&gt;   right_join: 4</span></span>
+<span id="cb23-34"><a href="#cb23-34" tabindex="-1"></a><span class="co">#&gt;   full_join: 5</span></span>
+<span id="cb23-35"><a href="#cb23-35" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb23-36"><a href="#cb23-36" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
+<span id="cb23-37"><a href="#cb23-37" tabindex="-1"></a><span class="co">#&gt;   near_match: 1</span></span>
+<span id="cb23-38"><a href="#cb23-38" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
+<span id="cb23-39"><a href="#cb23-39" tabindex="-1"></a><span class="fu">unlink</span>(txt_log)</span></code></pre></div>
+<p>The text entry mirrors the printed report – key column, per-table
+summaries, match analysis, expected rows per join type, and an issue
+tally – with a separator line so consecutive entries stay readable in
+one file. By default <code>log_report()</code> overwrites;
+<code>append = TRUE</code> adds to the end (text and log formats only),
+and the timestamp written with each entry means a grep for a date range
+works on the raw file.</p>
+<div class="sourceCode" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" tabindex="-1"></a><span class="co"># JSON format -- machine-readable</span></span>
+<span id="cb24-2"><a href="#cb24-2" tabindex="-1"></a>json_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.json&quot;</span>)</span>
+<span id="cb24-3"><a href="#cb24-3" tabindex="-1"></a><span class="fu">log_report</span>(report, json_log)</span>
+<span id="cb24-4"><a href="#cb24-4" tabindex="-1"></a><span class="co">#&gt; ✔ Report logged to &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpGsFaTd\fileac286c52755e.json&#39;</span></span>
+<span id="cb24-5"><a href="#cb24-5" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">readLines</span>(json_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
+<span id="cb24-6"><a href="#cb24-6" tabindex="-1"></a><span class="co">#&gt; {</span></span>
+<span id="cb24-7"><a href="#cb24-7" tabindex="-1"></a><span class="co">#&gt;   &quot;by&quot;: &quot;sensor_id&quot;,</span></span>
+<span id="cb24-8"><a href="#cb24-8" tabindex="-1"></a><span class="co">#&gt;   &quot;x_summary&quot;: {</span></span>
+<span id="cb24-9"><a href="#cb24-9" tabindex="-1"></a><span class="co">#&gt;   &quot;n_rows&quot;: 4,</span></span>
+<span id="cb24-10"><a href="#cb24-10" tabindex="-1"></a><span class="co">#&gt;   &quot;n_unique&quot;: 4,</span></span>
+<span id="cb24-11"><a href="#cb24-11" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicates&quot;: 0,</span></span>
+<span id="cb24-12"><a href="#cb24-12" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicate_rows&quot;: 0,</span></span>
+<span id="cb24-13"><a href="#cb24-13" tabindex="-1"></a><span class="co">#&gt;   &quot;n_na&quot;: 0</span></span>
+<span id="cb24-14"><a href="#cb24-14" tabindex="-1"></a><span class="co">#&gt; },</span></span>
+<span id="cb24-15"><a href="#cb24-15" tabindex="-1"></a><span class="co">#&gt;   &quot;y_summary&quot;: {</span></span>
+<span id="cb24-16"><a href="#cb24-16" tabindex="-1"></a><span class="co">#&gt;   &quot;n_rows&quot;: 4,</span></span>
+<span id="cb24-17"><a href="#cb24-17" tabindex="-1"></a><span class="co">#&gt;   &quot;n_unique&quot;: 4,</span></span>
+<span id="cb24-18"><a href="#cb24-18" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicates&quot;: 0,</span></span>
+<span id="cb24-19"><a href="#cb24-19" tabindex="-1"></a><span class="co">#&gt;   &quot;n_duplicate_rows&quot;: 0,</span></span>
+<span id="cb24-20"><a href="#cb24-20" tabindex="-1"></a><span class="co">#&gt;   &quot;n_na&quot;: 0</span></span>
+<span id="cb24-21"><a href="#cb24-21" tabindex="-1"></a><span class="co">#&gt; },</span></span>
+<span id="cb24-22"><a href="#cb24-22" tabindex="-1"></a><span class="co">#&gt;   &quot;match_analysis&quot;: {</span></span>
+<span id="cb24-23"><a href="#cb24-23" tabindex="-1"></a><span class="co">#&gt;   &quot;n_matched&quot;: 3,</span></span>
+<span id="cb24-24"><a href="#cb24-24" tabindex="-1"></a><span class="co">#&gt;   &quot;n_left_only&quot;: 1,</span></span>
+<span id="cb24-25"><a href="#cb24-25" tabindex="-1"></a><span class="co">#&gt;   &quot;n_right_only&quot;: 1,</span></span>
+<span id="cb24-26"><a href="#cb24-26" tabindex="-1"></a><span class="co">#&gt;   &quot;match_rate&quot;: 0.75</span></span>
+<span id="cb24-27"><a href="#cb24-27" tabindex="-1"></a><span class="co">#&gt; },</span></span>
+<span id="cb24-28"><a href="#cb24-28" tabindex="-1"></a><span class="co">#&gt;   &quot;expected_rows&quot;: {</span></span>
+<span id="cb24-29"><a href="#cb24-29" tabindex="-1"></a><span class="co">#&gt;   &quot;inner&quot;: 3,</span></span>
+<span id="cb24-30"><a href="#cb24-30" tabindex="-1"></a><span class="co">#&gt;   &quot;left&quot;: 4,</span></span>
+<span id="cb24-31"><a href="#cb24-31" tabindex="-1"></a><span class="co">#&gt;   &quot;right&quot;: 4,</span></span>
+<span id="cb24-32"><a href="#cb24-32" tabindex="-1"></a><span class="co">#&gt;   &quot;full&quot;: 5</span></span>
+<span id="cb24-33"><a href="#cb24-33" tabindex="-1"></a><span class="co">#&gt; },</span></span>
+<span id="cb24-34"><a href="#cb24-34" tabindex="-1"></a><span class="co">#&gt;   &quot;n_issues&quot;: 1,</span></span>
+<span id="cb24-35"><a href="#cb24-35" tabindex="-1"></a><span class="co">#&gt;   &quot;issue_types&quot;: &quot;near_match&quot;,</span></span>
+<span id="cb24-36"><a href="#cb24-36" tabindex="-1"></a><span class="co">#&gt;   &quot;logged_at&quot;: &quot;2026-06-13 01:39:39&quot;</span></span>
+<span id="cb24-37"><a href="#cb24-37" tabindex="-1"></a><span class="co">#&gt; }</span></span>
+<span id="cb24-38"><a href="#cb24-38" tabindex="-1"></a><span class="fu">unlink</span>(json_log)</span></code></pre></div>
 <p>Text format works for tailing logs during a batch run; JSON format
 feeds into monitoring systems or downstream scripts. Reports can also be
 saved as <code>.rds</code> files, which preserves the full R object for
-later interactive inspection.</p>
+later interactive inspection. The <code>.rds</code> route matters when
+the issues themselves need preserving: text and JSON record issue counts
+and types, while the RDS file keeps each issue’s <code>details</code>
+element – the actual offending key values – which is what we want in
+front of us when reconstructing what went wrong last Tuesday.</p>
 </div>
 <div id="automatic-logging" class="section level3">
 <h3>Automatic logging</h3>
@@ -630,85 +885,99 @@ later interactive inspection.</p>
 is cleaner than calling <code>log_report()</code> after each one. Every
 subsequent <code>*_join_spy()</code> call appends its report to the
 file.</p>
-<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a>auto_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
-<span id="cb14-2"><a href="#cb14-2" tabindex="-1"></a><span class="fu">set_log_file</span>(auto_log, <span class="at">format =</span> <span class="st">&quot;text&quot;</span>)</span>
-<span id="cb14-3"><a href="#cb14-3" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging enabled: &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpSoloDX\file427c106a28f3.log&#39;</span></span>
-<span id="cb14-4"><a href="#cb14-4" tabindex="-1"></a></span>
-<span id="cb14-5"><a href="#cb14-5" tabindex="-1"></a><span class="co"># These joins are automatically logged</span></span>
-<span id="cb14-6"><a href="#cb14-6" tabindex="-1"></a>result1 <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb14-7"><a href="#cb14-7" tabindex="-1"></a>result2 <span class="ot">&lt;-</span> <span class="fu">inner_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb14-8"><a href="#cb14-8" tabindex="-1"></a></span>
-<span id="cb14-9"><a href="#cb14-9" tabindex="-1"></a><span class="co"># Check what got logged</span></span>
-<span id="cb14-10"><a href="#cb14-10" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">readLines</span>(auto_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
-<span id="cb14-11"><a href="#cb14-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-12"><a href="#cb14-12" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-12 23:19:27</span></span>
-<span id="cb14-13"><a href="#cb14-13" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
-<span id="cb14-14"><a href="#cb14-14" tabindex="-1"></a><span class="co">#&gt; Join Key: sensor_id</span></span>
-<span id="cb14-15"><a href="#cb14-15" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-16"><a href="#cb14-16" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
-<span id="cb14-17"><a href="#cb14-17" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
-<span id="cb14-18"><a href="#cb14-18" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
-<span id="cb14-19"><a href="#cb14-19" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb14-20"><a href="#cb14-20" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb14-21"><a href="#cb14-21" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-22"><a href="#cb14-22" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
-<span id="cb14-23"><a href="#cb14-23" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
-<span id="cb14-24"><a href="#cb14-24" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
-<span id="cb14-25"><a href="#cb14-25" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb14-26"><a href="#cb14-26" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb14-27"><a href="#cb14-27" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-28"><a href="#cb14-28" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
-<span id="cb14-29"><a href="#cb14-29" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 3</span></span>
-<span id="cb14-30"><a href="#cb14-30" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 1</span></span>
-<span id="cb14-31"><a href="#cb14-31" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
-<span id="cb14-32"><a href="#cb14-32" tabindex="-1"></a><span class="co">#&gt;   Match rate: 75%</span></span>
-<span id="cb14-33"><a href="#cb14-33" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-34"><a href="#cb14-34" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
-<span id="cb14-35"><a href="#cb14-35" tabindex="-1"></a><span class="co">#&gt;   inner_join: 3</span></span>
-<span id="cb14-36"><a href="#cb14-36" tabindex="-1"></a><span class="co">#&gt;   left_join: 4</span></span>
-<span id="cb14-37"><a href="#cb14-37" tabindex="-1"></a><span class="co">#&gt;   right_join: 4</span></span>
-<span id="cb14-38"><a href="#cb14-38" tabindex="-1"></a><span class="co">#&gt;   full_join: 5</span></span>
-<span id="cb14-39"><a href="#cb14-39" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-40"><a href="#cb14-40" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
-<span id="cb14-41"><a href="#cb14-41" tabindex="-1"></a><span class="co">#&gt;   near_match: 1</span></span>
-<span id="cb14-42"><a href="#cb14-42" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
-<span id="cb14-43"><a href="#cb14-43" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-44"><a href="#cb14-44" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-12 23:19:27</span></span>
-<span id="cb14-45"><a href="#cb14-45" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
-<span id="cb14-46"><a href="#cb14-46" tabindex="-1"></a><span class="co">#&gt; Join Key: sensor_id</span></span>
-<span id="cb14-47"><a href="#cb14-47" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-48"><a href="#cb14-48" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
-<span id="cb14-49"><a href="#cb14-49" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
-<span id="cb14-50"><a href="#cb14-50" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
-<span id="cb14-51"><a href="#cb14-51" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb14-52"><a href="#cb14-52" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb14-53"><a href="#cb14-53" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-54"><a href="#cb14-54" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
-<span id="cb14-55"><a href="#cb14-55" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
-<span id="cb14-56"><a href="#cb14-56" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
-<span id="cb14-57"><a href="#cb14-57" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb14-58"><a href="#cb14-58" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb14-59"><a href="#cb14-59" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-60"><a href="#cb14-60" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
-<span id="cb14-61"><a href="#cb14-61" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 3</span></span>
-<span id="cb14-62"><a href="#cb14-62" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 1</span></span>
-<span id="cb14-63"><a href="#cb14-63" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
-<span id="cb14-64"><a href="#cb14-64" tabindex="-1"></a><span class="co">#&gt;   Match rate: 75%</span></span>
-<span id="cb14-65"><a href="#cb14-65" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-66"><a href="#cb14-66" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
-<span id="cb14-67"><a href="#cb14-67" tabindex="-1"></a><span class="co">#&gt;   inner_join: 3</span></span>
-<span id="cb14-68"><a href="#cb14-68" tabindex="-1"></a><span class="co">#&gt;   left_join: 4</span></span>
-<span id="cb14-69"><a href="#cb14-69" tabindex="-1"></a><span class="co">#&gt;   right_join: 4</span></span>
-<span id="cb14-70"><a href="#cb14-70" tabindex="-1"></a><span class="co">#&gt;   full_join: 5</span></span>
-<span id="cb14-71"><a href="#cb14-71" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb14-72"><a href="#cb14-72" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
-<span id="cb14-73"><a href="#cb14-73" tabindex="-1"></a><span class="co">#&gt;   near_match: 1</span></span>
-<span id="cb14-74"><a href="#cb14-74" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
-<span id="cb14-75"><a href="#cb14-75" tabindex="-1"></a></span>
-<span id="cb14-76"><a href="#cb14-76" tabindex="-1"></a><span class="co"># Clean up</span></span>
-<span id="cb14-77"><a href="#cb14-77" tabindex="-1"></a><span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
-<span id="cb14-78"><a href="#cb14-78" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging disabled</span></span>
-<span id="cb14-79"><a href="#cb14-79" tabindex="-1"></a><span class="fu">unlink</span>(auto_log)</span></code></pre></div>
+<div class="sourceCode" id="cb25"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb25-1"><a href="#cb25-1" tabindex="-1"></a>auto_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
+<span id="cb25-2"><a href="#cb25-2" tabindex="-1"></a><span class="fu">set_log_file</span>(auto_log, <span class="at">format =</span> <span class="st">&quot;text&quot;</span>)</span>
+<span id="cb25-3"><a href="#cb25-3" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging enabled: &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpGsFaTd\fileac2814a33b25.log&#39;</span></span>
+<span id="cb25-4"><a href="#cb25-4" tabindex="-1"></a></span>
+<span id="cb25-5"><a href="#cb25-5" tabindex="-1"></a><span class="co"># These joins are automatically logged</span></span>
+<span id="cb25-6"><a href="#cb25-6" tabindex="-1"></a>result1 <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb25-7"><a href="#cb25-7" tabindex="-1"></a>result2 <span class="ot">&lt;-</span> <span class="fu">inner_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb25-8"><a href="#cb25-8" tabindex="-1"></a></span>
+<span id="cb25-9"><a href="#cb25-9" tabindex="-1"></a><span class="co"># Check what got logged</span></span>
+<span id="cb25-10"><a href="#cb25-10" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">readLines</span>(auto_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
+<span id="cb25-11"><a href="#cb25-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-12"><a href="#cb25-12" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-13 01:39:39</span></span>
+<span id="cb25-13"><a href="#cb25-13" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
+<span id="cb25-14"><a href="#cb25-14" tabindex="-1"></a><span class="co">#&gt; Join Key: sensor_id</span></span>
+<span id="cb25-15"><a href="#cb25-15" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-16"><a href="#cb25-16" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
+<span id="cb25-17"><a href="#cb25-17" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
+<span id="cb25-18"><a href="#cb25-18" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
+<span id="cb25-19"><a href="#cb25-19" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb25-20"><a href="#cb25-20" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb25-21"><a href="#cb25-21" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-22"><a href="#cb25-22" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
+<span id="cb25-23"><a href="#cb25-23" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
+<span id="cb25-24"><a href="#cb25-24" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
+<span id="cb25-25"><a href="#cb25-25" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb25-26"><a href="#cb25-26" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb25-27"><a href="#cb25-27" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-28"><a href="#cb25-28" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
+<span id="cb25-29"><a href="#cb25-29" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 3</span></span>
+<span id="cb25-30"><a href="#cb25-30" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 1</span></span>
+<span id="cb25-31"><a href="#cb25-31" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
+<span id="cb25-32"><a href="#cb25-32" tabindex="-1"></a><span class="co">#&gt;   Match rate: 75%</span></span>
+<span id="cb25-33"><a href="#cb25-33" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-34"><a href="#cb25-34" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
+<span id="cb25-35"><a href="#cb25-35" tabindex="-1"></a><span class="co">#&gt;   inner_join: 3</span></span>
+<span id="cb25-36"><a href="#cb25-36" tabindex="-1"></a><span class="co">#&gt;   left_join: 4</span></span>
+<span id="cb25-37"><a href="#cb25-37" tabindex="-1"></a><span class="co">#&gt;   right_join: 4</span></span>
+<span id="cb25-38"><a href="#cb25-38" tabindex="-1"></a><span class="co">#&gt;   full_join: 5</span></span>
+<span id="cb25-39"><a href="#cb25-39" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-40"><a href="#cb25-40" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
+<span id="cb25-41"><a href="#cb25-41" tabindex="-1"></a><span class="co">#&gt;   near_match: 1</span></span>
+<span id="cb25-42"><a href="#cb25-42" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
+<span id="cb25-43"><a href="#cb25-43" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-44"><a href="#cb25-44" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-13 01:39:39</span></span>
+<span id="cb25-45"><a href="#cb25-45" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
+<span id="cb25-46"><a href="#cb25-46" tabindex="-1"></a><span class="co">#&gt; Join Key: sensor_id</span></span>
+<span id="cb25-47"><a href="#cb25-47" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-48"><a href="#cb25-48" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
+<span id="cb25-49"><a href="#cb25-49" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
+<span id="cb25-50"><a href="#cb25-50" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
+<span id="cb25-51"><a href="#cb25-51" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb25-52"><a href="#cb25-52" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb25-53"><a href="#cb25-53" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-54"><a href="#cb25-54" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
+<span id="cb25-55"><a href="#cb25-55" tabindex="-1"></a><span class="co">#&gt;   Rows: 4</span></span>
+<span id="cb25-56"><a href="#cb25-56" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 4</span></span>
+<span id="cb25-57"><a href="#cb25-57" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb25-58"><a href="#cb25-58" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb25-59"><a href="#cb25-59" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-60"><a href="#cb25-60" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
+<span id="cb25-61"><a href="#cb25-61" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 3</span></span>
+<span id="cb25-62"><a href="#cb25-62" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 1</span></span>
+<span id="cb25-63"><a href="#cb25-63" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
+<span id="cb25-64"><a href="#cb25-64" tabindex="-1"></a><span class="co">#&gt;   Match rate: 75%</span></span>
+<span id="cb25-65"><a href="#cb25-65" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-66"><a href="#cb25-66" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
+<span id="cb25-67"><a href="#cb25-67" tabindex="-1"></a><span class="co">#&gt;   inner_join: 3</span></span>
+<span id="cb25-68"><a href="#cb25-68" tabindex="-1"></a><span class="co">#&gt;   left_join: 4</span></span>
+<span id="cb25-69"><a href="#cb25-69" tabindex="-1"></a><span class="co">#&gt;   right_join: 4</span></span>
+<span id="cb25-70"><a href="#cb25-70" tabindex="-1"></a><span class="co">#&gt;   full_join: 5</span></span>
+<span id="cb25-71"><a href="#cb25-71" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb25-72"><a href="#cb25-72" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
+<span id="cb25-73"><a href="#cb25-73" tabindex="-1"></a><span class="co">#&gt;   near_match: 1</span></span>
+<span id="cb25-74"><a href="#cb25-74" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
+<span id="cb25-75"><a href="#cb25-75" tabindex="-1"></a></span>
+<span id="cb25-76"><a href="#cb25-76" tabindex="-1"></a><span class="co"># Clean up</span></span>
+<span id="cb25-77"><a href="#cb25-77" tabindex="-1"></a><span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
+<span id="cb25-78"><a href="#cb25-78" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging disabled</span></span>
+<span id="cb25-79"><a href="#cb25-79" tabindex="-1"></a><span class="fu">unlink</span>(auto_log)</span></code></pre></div>
+<p>Each wrapper call appends one entry, so the file accumulates a
+join-by-join history of the run even when every join is
+<code>.quiet</code>. <code>set_log_file()</code> returns the previous
+setting invisibly, which lets a function enable logging for its own
+joins and then put back whatever the caller had configured:</p>
+<div class="sourceCode" id="cb26"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" tabindex="-1"></a>fn_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
+<span id="cb26-2"><a href="#cb26-2" tabindex="-1"></a>previous <span class="ot">&lt;-</span> <span class="fu">set_log_file</span>(fn_log)</span>
+<span id="cb26-3"><a href="#cb26-3" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging enabled: &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpGsFaTd\fileac282c7c3c23.log&#39;</span></span>
+<span id="cb26-4"><a href="#cb26-4" tabindex="-1"></a></span>
+<span id="cb26-5"><a href="#cb26-5" tabindex="-1"></a>result <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb26-6"><a href="#cb26-6" tabindex="-1"></a></span>
+<span id="cb26-7"><a href="#cb26-7" tabindex="-1"></a><span class="fu">set_log_file</span>(previous)</span>
+<span id="cb26-8"><a href="#cb26-8" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging disabled</span></span>
+<span id="cb26-9"><a href="#cb26-9" tabindex="-1"></a><span class="fu">unlink</span>(fn_log)</span></code></pre></div>
 <p>Automatic logging only triggers from <code>*_join_spy()</code>
 wrappers. <code>join_strict()</code> and bare <code>merge()</code> calls
 are not logged – the wrappers are the instrumented path. To combine
@@ -716,48 +985,197 @@ cardinality enforcement with logging, run
 <code>detect_cardinality()</code> as a separate check and use a
 <code>*_join_spy()</code> wrapper for the actual join.</p>
 <p><code>get_log_file()</code> returns the current log path (or
-<code>NULL</code> if logging is disabled):</p>
-<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a><span class="co"># Only log if logging is configured</span></span>
-<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">get_log_file</span>())) {</span>
-<span id="cb15-3"><a href="#cb15-3" tabindex="-1"></a>  <span class="fu">message</span>(<span class="st">&quot;Logging is active at: &quot;</span>, <span class="fu">get_log_file</span>())</span>
-<span id="cb15-4"><a href="#cb15-4" tabindex="-1"></a>}</span></code></pre></div>
+<code>NULL</code> if logging is disabled), which is useful inside
+helpers that should log only when the surrounding pipeline asked for
+it:</p>
+<div class="sourceCode" id="cb27"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb27-1"><a href="#cb27-1" tabindex="-1"></a><span class="co"># Only log if logging is configured</span></span>
+<span id="cb27-2"><a href="#cb27-2" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span><span class="fu">is.null</span>(<span class="fu">get_log_file</span>())) {</span>
+<span id="cb27-3"><a href="#cb27-3" tabindex="-1"></a>  <span class="fu">message</span>(<span class="st">&quot;Logging is active at: &quot;</span>, <span class="fu">get_log_file</span>())</span>
+<span id="cb27-4"><a href="#cb27-4" tabindex="-1"></a>}</span></code></pre></div>
 </div>
+</div>
+<div id="reading-json-logs-downstream" class="section level2">
+<h2>Reading JSON Logs Downstream</h2>
+<p>The JSON format exists for consumers that are not R: a dashboard, a
+cron wrapper in Python, a shell script that greps last night’s log.
+joinspy serializes reports with an internal base-R writer, so the
+package carries no JSON dependency, and the output is plain JSON that
+any parser reads. Each entry records the join key, both table summaries,
+the match analysis, the expected row counts, the issue count and types,
+and a timestamp.</p>
+<p>Each report is appended as its own object, so the file is a sequence
+of JSON objects; line-oriented tools work on it directly, and a full
+parser reads it one object at a time. Reading it back in R needs nothing
+beyond base functions, so we log two joins and then play the part of the
+monitoring script:</p>
+<div class="sourceCode" id="cb28"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" tabindex="-1"></a>json_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.json&quot;</span>)</span>
+<span id="cb28-2"><a href="#cb28-2" tabindex="-1"></a><span class="fu">set_log_file</span>(json_log, <span class="at">format =</span> <span class="st">&quot;json&quot;</span>)</span>
+<span id="cb28-3"><a href="#cb28-3" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging enabled: &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpGsFaTd\fileac284a3916ce.json&#39;</span></span>
+<span id="cb28-4"><a href="#cb28-4" tabindex="-1"></a></span>
+<span id="cb28-5"><a href="#cb28-5" tabindex="-1"></a>r1 <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(sensors, readings, <span class="at">by =</span> <span class="st">&quot;sensor_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-6"><a href="#cb28-6" tabindex="-1"></a>r2 <span class="ot">&lt;-</span> <span class="fu">inner_join_spy</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb28-7"><a href="#cb28-7" tabindex="-1"></a></span>
+<span id="cb28-8"><a href="#cb28-8" tabindex="-1"></a><span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
+<span id="cb28-9"><a href="#cb28-9" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging disabled</span></span></code></pre></div>
+<p>The monitoring side reads the file, finds the lines carrying the
+field it cares about, and extracts the values:</p>
+<div class="sourceCode" id="cb29"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb29-1"><a href="#cb29-1" tabindex="-1"></a>log_lines <span class="ot">&lt;-</span> <span class="fu">readLines</span>(json_log)</span>
+<span id="cb29-2"><a href="#cb29-2" tabindex="-1"></a>rate_lines <span class="ot">&lt;-</span> <span class="fu">grep</span>(<span class="st">&#39;&quot;match_rate&quot;&#39;</span>, log_lines, <span class="at">value =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb29-3"><a href="#cb29-3" tabindex="-1"></a>rate_lines</span>
+<span id="cb29-4"><a href="#cb29-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;  \&quot;match_rate\&quot;: 0.75&quot; &quot;  \&quot;match_rate\&quot;: 1&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb30"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" tabindex="-1"></a>rates <span class="ot">&lt;-</span> <span class="fu">as.numeric</span>(<span class="fu">sub</span>(<span class="st">&#39;.*&quot;match_rate&quot;: *([0-9.]+).*&#39;</span>, <span class="st">&quot;</span><span class="sc">\\</span><span class="st">1&quot;</span>, rate_lines))</span>
+<span id="cb30-2"><a href="#cb30-2" tabindex="-1"></a>rates</span>
+<span id="cb30-3"><a href="#cb30-3" tabindex="-1"></a><span class="co">#&gt; [1] 0.75 1.00</span></span>
+<span id="cb30-4"><a href="#cb30-4" tabindex="-1"></a><span class="fu">which</span>(rates <span class="sc">&lt;</span> <span class="fl">0.95</span>)</span>
+<span id="cb30-5"><a href="#cb30-5" tabindex="-1"></a><span class="co">#&gt; [1] 1</span></span>
+<span id="cb30-6"><a href="#cb30-6" tabindex="-1"></a><span class="fu">unlink</span>(json_log)</span></code></pre></div>
+<p>The sensor join logged its 75% match rate, the order join a clean
+100%, and the threshold flags entry one. The same extract pattern works
+on <code>&quot;n_issues&quot;</code> for issue-count alerting. It also works on
+<code>&quot;logged_at&quot;</code> for staleness checks – a pipeline whose newest
+log entry is two days old has a different problem than a pipeline
+logging failures, and the timestamp catches it. For richer processing,
+any JSON library parses the entries one object at a time; the field
+names match the report components walked through earlier, so a script
+written against the JSON and a script written against
+<code>last_report()</code> read the same vocabulary.</p>
+</div>
+<div id="diagnosing-a-multi-join-pipeline" class="section level2">
+<h2>Diagnosing a Multi-Join Pipeline</h2>
+<p>Real pipelines chain joins: orders pick up customer attributes,
+customers pick up regions, regions pick up targets. When the final table
+has the wrong row count, the offending join could be any of them, and
+checking each one by hand means re-running the pipeline step by step.
+<code>analyze_join_chain()</code> does that walk in one call – it takes
+a named list of tables and a list of join specifications, runs
+<code>join_spy()</code> at every step, carries the intermediate result
+forward with a left join, and prints a per-step summary.</p>
+<div class="sourceCode" id="cb31"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb31-1"><a href="#cb31-1" tabindex="-1"></a>orders_chain <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb31-2"><a href="#cb31-2" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">6</span>,</span>
+<span id="cb31-3"><a href="#cb31-3" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C1&quot;</span>, <span class="st">&quot;C2&quot;</span>, <span class="st">&quot;C2&quot;</span>, <span class="st">&quot;C3&quot;</span>, <span class="st">&quot;C4&quot;</span>, <span class="st">&quot;C4&quot;</span>),</span>
+<span id="cb31-4"><a href="#cb31-4" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb31-5"><a href="#cb31-5" tabindex="-1"></a>)</span>
+<span id="cb31-6"><a href="#cb31-6" tabindex="-1"></a></span>
+<span id="cb31-7"><a href="#cb31-7" tabindex="-1"></a>customers_chain <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb31-8"><a href="#cb31-8" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C1&quot;</span>, <span class="st">&quot;C2&quot;</span>, <span class="st">&quot;C3&quot;</span>, <span class="st">&quot;C4&quot;</span>),</span>
+<span id="cb31-9"><a href="#cb31-9" tabindex="-1"></a>  <span class="at">region_id =</span> <span class="fu">c</span>(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;R1&quot;</span>, <span class="st">&quot;R2&quot;</span>, <span class="st">&quot;R3&quot;</span>),</span>
+<span id="cb31-10"><a href="#cb31-10" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb31-11"><a href="#cb31-11" tabindex="-1"></a>)</span>
+<span id="cb31-12"><a href="#cb31-12" tabindex="-1"></a></span>
+<span id="cb31-13"><a href="#cb31-13" tabindex="-1"></a>regions <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb31-14"><a href="#cb31-14" tabindex="-1"></a>  <span class="at">region_id =</span> <span class="fu">c</span>(<span class="st">&quot;R1&quot;</span>, <span class="st">&quot;R2&quot;</span>),</span>
+<span id="cb31-15"><a href="#cb31-15" tabindex="-1"></a>  <span class="at">region_name =</span> <span class="fu">c</span>(<span class="st">&quot;North&quot;</span>, <span class="st">&quot;South&quot;</span>),</span>
+<span id="cb31-16"><a href="#cb31-16" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb31-17"><a href="#cb31-17" tabindex="-1"></a>)</span></code></pre></div>
+<div class="sourceCode" id="cb32"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb32-1"><a href="#cb32-1" tabindex="-1"></a>chain <span class="ot">&lt;-</span> <span class="fu">analyze_join_chain</span>(</span>
+<span id="cb32-2"><a href="#cb32-2" tabindex="-1"></a>  <span class="at">tables =</span> <span class="fu">list</span>(<span class="at">orders =</span> orders_chain, <span class="at">customers =</span> customers_chain,</span>
+<span id="cb32-3"><a href="#cb32-3" tabindex="-1"></a>                <span class="at">regions =</span> regions),</span>
+<span id="cb32-4"><a href="#cb32-4" tabindex="-1"></a>  <span class="at">joins =</span> <span class="fu">list</span>(</span>
+<span id="cb32-5"><a href="#cb32-5" tabindex="-1"></a>    <span class="fu">list</span>(<span class="at">left =</span> <span class="st">&quot;orders&quot;</span>, <span class="at">right =</span> <span class="st">&quot;customers&quot;</span>, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>),</span>
+<span id="cb32-6"><a href="#cb32-6" tabindex="-1"></a>    <span class="fu">list</span>(<span class="at">left =</span> <span class="st">&quot;result&quot;</span>, <span class="at">right =</span> <span class="st">&quot;regions&quot;</span>, <span class="at">by =</span> <span class="st">&quot;region_id&quot;</span>)</span>
+<span id="cb32-7"><a href="#cb32-7" tabindex="-1"></a>  )</span>
+<span id="cb32-8"><a href="#cb32-8" tabindex="-1"></a>)</span>
+<span id="cb32-9"><a href="#cb32-9" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-10"><a href="#cb32-10" tabindex="-1"></a><span class="co">#&gt; ── Join Chain Analysis ─────────────────────────────────────────────────────────</span></span>
+<span id="cb32-11"><a href="#cb32-11" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-12"><a href="#cb32-12" tabindex="-1"></a><span class="co">#&gt; ── Step 1: orders + customers ──</span></span>
+<span id="cb32-13"><a href="#cb32-13" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-14"><a href="#cb32-14" tabindex="-1"></a><span class="co">#&gt; Left: 6 rows</span></span>
+<span id="cb32-15"><a href="#cb32-15" tabindex="-1"></a><span class="co">#&gt; Right: 4 rows</span></span>
+<span id="cb32-16"><a href="#cb32-16" tabindex="-1"></a><span class="co">#&gt; Match rate: 100%</span></span>
+<span id="cb32-17"><a href="#cb32-17" tabindex="-1"></a><span class="co">#&gt; Expected result: 6 rows (left join)</span></span>
+<span id="cb32-18"><a href="#cb32-18" tabindex="-1"></a><span class="co">#&gt; ! 1 issue(s) detected</span></span>
+<span id="cb32-19"><a href="#cb32-19" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-20"><a href="#cb32-20" tabindex="-1"></a><span class="co">#&gt; ── Step 2: result + regions ──</span></span>
+<span id="cb32-21"><a href="#cb32-21" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-22"><a href="#cb32-22" tabindex="-1"></a><span class="co">#&gt; Left: 6 rows</span></span>
+<span id="cb32-23"><a href="#cb32-23" tabindex="-1"></a><span class="co">#&gt; Right: 2 rows</span></span>
+<span id="cb32-24"><a href="#cb32-24" tabindex="-1"></a><span class="co">#&gt; Match rate: 66.7%</span></span>
+<span id="cb32-25"><a href="#cb32-25" tabindex="-1"></a><span class="co">#&gt; Expected result: 6 rows (left join)</span></span>
+<span id="cb32-26"><a href="#cb32-26" tabindex="-1"></a><span class="co">#&gt; ! 1 issue(s) detected</span></span>
+<span id="cb32-27"><a href="#cb32-27" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-28"><a href="#cb32-28" tabindex="-1"></a><span class="co">#&gt; ── Chain Summary ──</span></span>
+<span id="cb32-29"><a href="#cb32-29" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb32-30"><a href="#cb32-30" tabindex="-1"></a><span class="co">#&gt; ! Total issues across chain: 2</span></span></code></pre></div>
+<p>The literal name <code>&quot;result&quot;</code> refers to the accumulated
+output of the previous steps, so chains of any length need only that one
+keyword. Step 1 reports the order-side duplicates, which are expected
+for transaction data joining a lookup. The real finding is at step 2,
+where the match rate drops: region <code>&quot;R3&quot;</code> exists in the
+customer table and has no row in <code>regions</code>. That is the kind
+of fact that hides for months in a three-join pipeline, because each
+individual join “works”.</p>
+<p>The return value is a list with one entry per step, each holding the
+table names, the <code>by</code> columns, and the full
+<code>JoinReport</code>, so everything from the programmatic-inspection
+section applies per step:</p>
+<div class="sourceCode" id="cb33"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb33-1"><a href="#cb33-1" tabindex="-1"></a>chain[[<span class="dv">2</span>]]<span class="sc">$</span>report<span class="sc">$</span>match_analysis<span class="sc">$</span>match_rate</span>
+<span id="cb33-2"><a href="#cb33-2" tabindex="-1"></a><span class="co">#&gt; [1] 0.6666667</span></span>
+<span id="cb33-3"><a href="#cb33-3" tabindex="-1"></a>chain[[<span class="dv">2</span>]]<span class="sc">$</span>report<span class="sc">$</span>match_analysis<span class="sc">$</span>left_only_keys</span>
+<span id="cb33-4"><a href="#cb33-4" tabindex="-1"></a><span class="co">#&gt; [1] &quot;R3&quot;</span></span></code></pre></div>
+<p>A chain-level gate reduces to one vector:</p>
+<div class="sourceCode" id="cb34"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb34-1"><a href="#cb34-1" tabindex="-1"></a><span class="fu">vapply</span>(chain, <span class="cf">function</span>(s) <span class="fu">length</span>(s<span class="sc">$</span>report<span class="sc">$</span>issues), <span class="fu">integer</span>(<span class="dv">1</span>))</span>
+<span id="cb34-2"><a href="#cb34-2" tabindex="-1"></a><span class="co">#&gt; [1] 1 1</span></span></code></pre></div>
+<p>In production we run the chain analysis at deployment time and
+whenever an upstream schema changes. Since it performs each intermediate
+left join to feed the next step, its cost is comparable to running the
+pipeline’s joins once, which makes it a pre-flight and post-incident
+tool; the per-run gates stay with <code>key_check()</code> and
+<code>join_strict()</code>.</p>
 </div>
 <div id="sampling-for-large-datasets" class="section level2">
 <h2>Sampling for Large Datasets</h2>
 <p>The <code>sample</code> parameter in <code>join_spy()</code> runs the
 analysis on a random subset while the actual join (via a
 <code>*_join_spy()</code> wrapper) still operates on the full data.</p>
-<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a><span class="co"># Simulate a large dataset</span></span>
-<span id="cb16-2"><a href="#cb16-2" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">42</span>)</span>
-<span id="cb16-3"><a href="#cb16-3" tabindex="-1"></a>big_orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb16-4"><a href="#cb16-4" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">sample</span>(<span class="fu">paste0</span>(<span class="st">&quot;C&quot;</span>, <span class="fu">sprintf</span>(<span class="st">&quot;%04d&quot;</span>, <span class="dv">1</span><span class="sc">:</span><span class="dv">5000</span>)), <span class="dv">50000</span>, <span class="at">replace =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb16-5"><a href="#cb16-5" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">round</span>(<span class="fu">runif</span>(<span class="dv">50000</span>, <span class="dv">10</span>, <span class="dv">500</span>), <span class="dv">2</span>),</span>
-<span id="cb16-6"><a href="#cb16-6" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb16-7"><a href="#cb16-7" tabindex="-1"></a>)</span>
-<span id="cb16-8"><a href="#cb16-8" tabindex="-1"></a></span>
-<span id="cb16-9"><a href="#cb16-9" tabindex="-1"></a>big_customers <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb16-10"><a href="#cb16-10" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">paste0</span>(<span class="st">&quot;C&quot;</span>, <span class="fu">sprintf</span>(<span class="st">&quot;%04d&quot;</span>, <span class="dv">1</span><span class="sc">:</span><span class="dv">6000</span>)),</span>
-<span id="cb16-11"><a href="#cb16-11" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">sample</span>(<span class="fu">c</span>(<span class="st">&quot;North&quot;</span>, <span class="st">&quot;South&quot;</span>, <span class="st">&quot;East&quot;</span>, <span class="st">&quot;West&quot;</span>), <span class="dv">6000</span>, <span class="at">replace =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb16-12"><a href="#cb16-12" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb16-13"><a href="#cb16-13" tabindex="-1"></a>)</span>
-<span id="cb16-14"><a href="#cb16-14" tabindex="-1"></a></span>
-<span id="cb16-15"><a href="#cb16-15" tabindex="-1"></a><span class="co"># Full analysis</span></span>
-<span id="cb16-16"><a href="#cb16-16" tabindex="-1"></a><span class="fu">system.time</span>(report_full <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(big_orders, big_customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>))</span>
-<span id="cb16-17"><a href="#cb16-17" tabindex="-1"></a><span class="co">#&gt;    user  system elapsed </span></span>
-<span id="cb16-18"><a href="#cb16-18" tabindex="-1"></a><span class="co">#&gt;    0.18    0.03    0.21</span></span>
-<span id="cb16-19"><a href="#cb16-19" tabindex="-1"></a></span>
-<span id="cb16-20"><a href="#cb16-20" tabindex="-1"></a><span class="co"># Sampled analysis</span></span>
-<span id="cb16-21"><a href="#cb16-21" tabindex="-1"></a><span class="fu">system.time</span>(report_sampled <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(big_orders, big_customers,</span>
-<span id="cb16-22"><a href="#cb16-22" tabindex="-1"></a>                                        <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">sample =</span> <span class="dv">5000</span>))</span>
-<span id="cb16-23"><a href="#cb16-23" tabindex="-1"></a><span class="co">#&gt;    user  system elapsed </span></span>
-<span id="cb16-24"><a href="#cb16-24" tabindex="-1"></a><span class="co">#&gt;    0.21    0.00    0.19</span></span></code></pre></div>
+<div class="sourceCode" id="cb35"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb35-1"><a href="#cb35-1" tabindex="-1"></a><span class="co"># Simulate a large dataset</span></span>
+<span id="cb35-2"><a href="#cb35-2" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">42</span>)</span>
+<span id="cb35-3"><a href="#cb35-3" tabindex="-1"></a>big_orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb35-4"><a href="#cb35-4" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">sample</span>(<span class="fu">paste0</span>(<span class="st">&quot;C&quot;</span>, <span class="fu">sprintf</span>(<span class="st">&quot;%04d&quot;</span>, <span class="dv">1</span><span class="sc">:</span><span class="dv">5000</span>)), <span class="dv">50000</span>, <span class="at">replace =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb35-5"><a href="#cb35-5" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">round</span>(<span class="fu">runif</span>(<span class="dv">50000</span>, <span class="dv">10</span>, <span class="dv">500</span>), <span class="dv">2</span>),</span>
+<span id="cb35-6"><a href="#cb35-6" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb35-7"><a href="#cb35-7" tabindex="-1"></a>)</span>
+<span id="cb35-8"><a href="#cb35-8" tabindex="-1"></a></span>
+<span id="cb35-9"><a href="#cb35-9" tabindex="-1"></a>big_customers <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb35-10"><a href="#cb35-10" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">paste0</span>(<span class="st">&quot;C&quot;</span>, <span class="fu">sprintf</span>(<span class="st">&quot;%04d&quot;</span>, <span class="dv">1</span><span class="sc">:</span><span class="dv">6000</span>)),</span>
+<span id="cb35-11"><a href="#cb35-11" tabindex="-1"></a>  <span class="at">region =</span> <span class="fu">sample</span>(<span class="fu">c</span>(<span class="st">&quot;North&quot;</span>, <span class="st">&quot;South&quot;</span>, <span class="st">&quot;East&quot;</span>, <span class="st">&quot;West&quot;</span>), <span class="dv">6000</span>, <span class="at">replace =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb35-12"><a href="#cb35-12" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb35-13"><a href="#cb35-13" tabindex="-1"></a>)</span>
+<span id="cb35-14"><a href="#cb35-14" tabindex="-1"></a></span>
+<span id="cb35-15"><a href="#cb35-15" tabindex="-1"></a><span class="co"># Full analysis</span></span>
+<span id="cb35-16"><a href="#cb35-16" tabindex="-1"></a><span class="fu">system.time</span>(report_full <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(big_orders, big_customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>))</span>
+<span id="cb35-17"><a href="#cb35-17" tabindex="-1"></a><span class="co">#&gt;    user  system elapsed </span></span>
+<span id="cb35-18"><a href="#cb35-18" tabindex="-1"></a><span class="co">#&gt;    0.44    0.09    0.53</span></span>
+<span id="cb35-19"><a href="#cb35-19" tabindex="-1"></a></span>
+<span id="cb35-20"><a href="#cb35-20" tabindex="-1"></a><span class="co"># Sampled analysis</span></span>
+<span id="cb35-21"><a href="#cb35-21" tabindex="-1"></a><span class="fu">system.time</span>(report_sampled <span class="ot">&lt;-</span> <span class="fu">join_spy</span>(big_orders, big_customers,</span>
+<span id="cb35-22"><a href="#cb35-22" tabindex="-1"></a>                                        <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">sample =</span> <span class="dv">5000</span>))</span>
+<span id="cb35-23"><a href="#cb35-23" tabindex="-1"></a><span class="co">#&gt;    user  system elapsed </span></span>
+<span id="cb35-24"><a href="#cb35-24" tabindex="-1"></a><span class="co">#&gt;    0.16    0.05    0.21</span></span></code></pre></div>
+<p>The sampled report records its own provenance in
+<code>report$sampling</code> – the sample size and the original row
+counts – and the printed report flags it, so a log reader can tell
+estimated diagnostics from exact ones:</p>
+<div class="sourceCode" id="cb36"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb36-1"><a href="#cb36-1" tabindex="-1"></a>report_sampled<span class="sc">$</span>sampling</span>
+<span id="cb36-2"><a href="#cb36-2" tabindex="-1"></a><span class="co">#&gt; $sampled</span></span>
+<span id="cb36-3"><a href="#cb36-3" tabindex="-1"></a><span class="co">#&gt; [1] TRUE</span></span>
+<span id="cb36-4"><a href="#cb36-4" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb36-5"><a href="#cb36-5" tabindex="-1"></a><span class="co">#&gt; $original_x_rows</span></span>
+<span id="cb36-6"><a href="#cb36-6" tabindex="-1"></a><span class="co">#&gt; [1] 50000</span></span>
+<span id="cb36-7"><a href="#cb36-7" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb36-8"><a href="#cb36-8" tabindex="-1"></a><span class="co">#&gt; $original_y_rows</span></span>
+<span id="cb36-9"><a href="#cb36-9" tabindex="-1"></a><span class="co">#&gt; [1] 6000</span></span>
+<span id="cb36-10"><a href="#cb36-10" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb36-11"><a href="#cb36-11" tabindex="-1"></a><span class="co">#&gt; $sample_size</span></span>
+<span id="cb36-12"><a href="#cb36-12" tabindex="-1"></a><span class="co">#&gt; [1] 5000</span></span></code></pre></div>
 <p>The sampled report is approximate – match rates and duplicate counts
 are estimated from the subset. For production monitoring, we typically
 care whether the match rate is roughly 95% or roughly 60%, not whether
 it is 94.7% or 95.1%. Sampling catches systemic problems (wrong key
 column, widespread encoding issues, duplicate explosion) with a fraction
-of the runtime.</p>
+of the runtime. A <code>set.seed()</code> ahead of the call makes the
+sampled diagnostic reproducible, which keeps two runs on identical data
+from flapping between alert and no alert.</p>
 <p>Sampling can miss rare issues. If 0.1% of keys have a zero-width
 space, a 5,000-row sample from a 10-million-row table might not include
 any. Running full diagnostics periodically (weekly, or when the upstream
@@ -769,129 +1187,189 @@ thoroughness.</p>
 <p>Here is a realistic production workflow: a nightly job loads order
 and customer data, validates keys, repairs if needed, joins with
 cardinality enforcement, and logs everything.</p>
-<div class="sourceCode" id="cb17"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb17-1"><a href="#cb17-1" tabindex="-1"></a><span class="co"># ============================================================</span></span>
-<span id="cb17-2"><a href="#cb17-2" tabindex="-1"></a><span class="co"># Nightly order enrichment pipeline</span></span>
-<span id="cb17-3"><a href="#cb17-3" tabindex="-1"></a><span class="co"># ============================================================</span></span>
-<span id="cb17-4"><a href="#cb17-4" tabindex="-1"></a></span>
-<span id="cb17-5"><a href="#cb17-5" tabindex="-1"></a><span class="co"># --- Setup logging ---</span></span>
-<span id="cb17-6"><a href="#cb17-6" tabindex="-1"></a>pipeline_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
-<span id="cb17-7"><a href="#cb17-7" tabindex="-1"></a><span class="fu">set_log_file</span>(pipeline_log, <span class="at">format =</span> <span class="st">&quot;text&quot;</span>)</span>
-<span id="cb17-8"><a href="#cb17-8" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging enabled: &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpSoloDX\file427c18b84578.log&#39;</span></span>
-<span id="cb17-9"><a href="#cb17-9" tabindex="-1"></a></span>
-<span id="cb17-10"><a href="#cb17-10" tabindex="-1"></a><span class="co"># --- Load data (simulated) ---</span></span>
-<span id="cb17-11"><a href="#cb17-11" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb17-12"><a href="#cb17-12" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">6</span>,</span>
-<span id="cb17-13"><a href="#cb17-13" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C001&quot;</span>, <span class="st">&quot;C002 &quot;</span>, <span class="st">&quot;C003&quot;</span>, <span class="st">&quot;C003&quot;</span>, <span class="st">&quot;C004&quot;</span>, <span class="st">&quot;C005&quot;</span>),</span>
-<span id="cb17-14"><a href="#cb17-14" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">150</span>, <span class="dv">230</span>, <span class="dv">89</span>, <span class="dv">410</span>, <span class="dv">320</span>, <span class="dv">175</span>),</span>
-<span id="cb17-15"><a href="#cb17-15" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb17-16"><a href="#cb17-16" tabindex="-1"></a>)</span>
-<span id="cb17-17"><a href="#cb17-17" tabindex="-1"></a></span>
-<span id="cb17-18"><a href="#cb17-18" tabindex="-1"></a>customers <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
-<span id="cb17-19"><a href="#cb17-19" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C001&quot;</span>, <span class="st">&quot;C002&quot;</span>, <span class="st">&quot;C003&quot;</span>, <span class="st">&quot;C004&quot;</span>, <span class="st">&quot;C005&quot;</span>, <span class="st">&quot;C006&quot;</span>),</span>
-<span id="cb17-20"><a href="#cb17-20" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Acme Corp&quot;</span>, <span class="st">&quot;Globex&quot;</span>, <span class="st">&quot;Initech&quot;</span>, <span class="st">&quot;Umbrella&quot;</span>, <span class="st">&quot;Soylent&quot;</span>, <span class="st">&quot;Wonka&quot;</span>),</span>
-<span id="cb17-21"><a href="#cb17-21" tabindex="-1"></a>  <span class="at">tier =</span> <span class="fu">c</span>(<span class="st">&quot;gold&quot;</span>, <span class="st">&quot;silver&quot;</span>, <span class="st">&quot;gold&quot;</span>, <span class="st">&quot;bronze&quot;</span>, <span class="st">&quot;silver&quot;</span>, <span class="st">&quot;gold&quot;</span>),</span>
-<span id="cb17-22"><a href="#cb17-22" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
-<span id="cb17-23"><a href="#cb17-23" tabindex="-1"></a>)</span>
-<span id="cb17-24"><a href="#cb17-24" tabindex="-1"></a></span>
-<span id="cb17-25"><a href="#cb17-25" tabindex="-1"></a><span class="co"># --- Gate 1: key quality assertion ---</span></span>
-<span id="cb17-26"><a href="#cb17-26" tabindex="-1"></a>keys_ok <span class="ot">&lt;-</span> <span class="fu">key_check</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb17-27"><a href="#cb17-27" tabindex="-1"></a></span>
-<span id="cb17-28"><a href="#cb17-28" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>keys_ok) {</span>
-<span id="cb17-29"><a href="#cb17-29" tabindex="-1"></a>  <span class="fu">message</span>(<span class="st">&quot;Key issues detected -- attempting repair&quot;</span>)</span>
-<span id="cb17-30"><a href="#cb17-30" tabindex="-1"></a>  repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(</span>
-<span id="cb17-31"><a href="#cb17-31" tabindex="-1"></a>    orders, customers,</span>
-<span id="cb17-32"><a href="#cb17-32" tabindex="-1"></a>    <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>,</span>
-<span id="cb17-33"><a href="#cb17-33" tabindex="-1"></a>    <span class="at">trim_whitespace =</span> <span class="cn">TRUE</span>,</span>
-<span id="cb17-34"><a href="#cb17-34" tabindex="-1"></a>    <span class="at">remove_invisible =</span> <span class="cn">TRUE</span></span>
-<span id="cb17-35"><a href="#cb17-35" tabindex="-1"></a>  )</span>
-<span id="cb17-36"><a href="#cb17-36" tabindex="-1"></a>  orders <span class="ot">&lt;-</span> repaired<span class="sc">$</span>x</span>
-<span id="cb17-37"><a href="#cb17-37" tabindex="-1"></a>  customers <span class="ot">&lt;-</span> repaired<span class="sc">$</span>y</span>
-<span id="cb17-38"><a href="#cb17-38" tabindex="-1"></a>}</span>
-<span id="cb17-39"><a href="#cb17-39" tabindex="-1"></a><span class="co">#&gt; Key issues detected -- attempting repair</span></span>
-<span id="cb17-40"><a href="#cb17-40" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 1 value(s)</span></span>
-<span id="cb17-41"><a href="#cb17-41" tabindex="-1"></a></span>
-<span id="cb17-42"><a href="#cb17-42" tabindex="-1"></a><span class="co"># --- Gate 2: cardinality check ---</span></span>
-<span id="cb17-43"><a href="#cb17-43" tabindex="-1"></a>card <span class="ot">&lt;-</span> <span class="fu">detect_cardinality</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
-<span id="cb17-44"><a href="#cb17-44" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;n:1&quot;</span></span>
-<span id="cb17-45"><a href="#cb17-45" tabindex="-1"></a><span class="co">#&gt; Left duplicates: 1 key(s)</span></span>
-<span id="cb17-46"><a href="#cb17-46" tabindex="-1"></a><span class="cf">if</span> (card <span class="sc">==</span> <span class="st">&quot;n:m&quot;</span>) {</span>
-<span id="cb17-47"><a href="#cb17-47" tabindex="-1"></a>  <span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
-<span id="cb17-48"><a href="#cb17-48" tabindex="-1"></a>  <span class="fu">unlink</span>(pipeline_log)</span>
-<span id="cb17-49"><a href="#cb17-49" tabindex="-1"></a>  <span class="fu">stop</span>(<span class="st">&quot;Unexpected n:m cardinality in orders-customers join&quot;</span>, <span class="at">call. =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb17-50"><a href="#cb17-50" tabindex="-1"></a>}</span>
-<span id="cb17-51"><a href="#cb17-51" tabindex="-1"></a></span>
-<span id="cb17-52"><a href="#cb17-52" tabindex="-1"></a><span class="co"># --- Join (with auto-logging via *_join_spy) ---</span></span>
-<span id="cb17-53"><a href="#cb17-53" tabindex="-1"></a>enriched <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
-<span id="cb17-54"><a href="#cb17-54" tabindex="-1"></a></span>
-<span id="cb17-55"><a href="#cb17-55" tabindex="-1"></a><span class="co"># --- Gate 3: row count sanity check ---</span></span>
-<span id="cb17-56"><a href="#cb17-56" tabindex="-1"></a><span class="co"># A left join should never lose rows from the left table</span></span>
-<span id="cb17-57"><a href="#cb17-57" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">nrow</span>(enriched) <span class="sc">&lt;</span> <span class="fu">nrow</span>(orders)) {</span>
-<span id="cb17-58"><a href="#cb17-58" tabindex="-1"></a>  <span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
-<span id="cb17-59"><a href="#cb17-59" tabindex="-1"></a>  <span class="fu">unlink</span>(pipeline_log)</span>
-<span id="cb17-60"><a href="#cb17-60" tabindex="-1"></a>  <span class="fu">stop</span>(<span class="st">&quot;Row count decreased after left join -- possible data corruption&quot;</span>,</span>
-<span id="cb17-61"><a href="#cb17-61" tabindex="-1"></a>       <span class="at">call. =</span> <span class="cn">FALSE</span>)</span>
-<span id="cb17-62"><a href="#cb17-62" tabindex="-1"></a>}</span>
-<span id="cb17-63"><a href="#cb17-63" tabindex="-1"></a></span>
-<span id="cb17-64"><a href="#cb17-64" tabindex="-1"></a><span class="co"># --- Output ---</span></span>
-<span id="cb17-65"><a href="#cb17-65" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">sprintf</span>(<span class="st">&quot;Pipeline complete: %d enriched orders&quot;</span>, <span class="fu">nrow</span>(enriched)))</span>
-<span id="cb17-66"><a href="#cb17-66" tabindex="-1"></a><span class="co">#&gt; Pipeline complete: 6 enriched orders</span></span>
-<span id="cb17-67"><a href="#cb17-67" tabindex="-1"></a><span class="fu">head</span>(enriched)</span>
-<span id="cb17-68"><a href="#cb17-68" tabindex="-1"></a><span class="co">#&gt;   customer_id order_id amount      name   tier</span></span>
-<span id="cb17-69"><a href="#cb17-69" tabindex="-1"></a><span class="co">#&gt; 1        C001        1    150 Acme Corp   gold</span></span>
-<span id="cb17-70"><a href="#cb17-70" tabindex="-1"></a><span class="co">#&gt; 2        C002        2    230    Globex silver</span></span>
-<span id="cb17-71"><a href="#cb17-71" tabindex="-1"></a><span class="co">#&gt; 3        C003        3     89   Initech   gold</span></span>
-<span id="cb17-72"><a href="#cb17-72" tabindex="-1"></a><span class="co">#&gt; 4        C003        4    410   Initech   gold</span></span>
-<span id="cb17-73"><a href="#cb17-73" tabindex="-1"></a><span class="co">#&gt; 5        C004        5    320  Umbrella bronze</span></span>
-<span id="cb17-74"><a href="#cb17-74" tabindex="-1"></a><span class="co">#&gt; 6        C005        6    175   Soylent silver</span></span>
-<span id="cb17-75"><a href="#cb17-75" tabindex="-1"></a></span>
-<span id="cb17-76"><a href="#cb17-76" tabindex="-1"></a><span class="co"># --- Review the log ---</span></span>
-<span id="cb17-77"><a href="#cb17-77" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">file.exists</span>(pipeline_log)) {</span>
-<span id="cb17-78"><a href="#cb17-78" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">readLines</span>(pipeline_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
-<span id="cb17-79"><a href="#cb17-79" tabindex="-1"></a>}</span>
-<span id="cb17-80"><a href="#cb17-80" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb17-81"><a href="#cb17-81" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-12 23:19:27</span></span>
-<span id="cb17-82"><a href="#cb17-82" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
-<span id="cb17-83"><a href="#cb17-83" tabindex="-1"></a><span class="co">#&gt; Join Key: customer_id</span></span>
-<span id="cb17-84"><a href="#cb17-84" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb17-85"><a href="#cb17-85" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
-<span id="cb17-86"><a href="#cb17-86" tabindex="-1"></a><span class="co">#&gt;   Rows: 6</span></span>
-<span id="cb17-87"><a href="#cb17-87" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 5</span></span>
-<span id="cb17-88"><a href="#cb17-88" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 1</span></span>
-<span id="cb17-89"><a href="#cb17-89" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb17-90"><a href="#cb17-90" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb17-91"><a href="#cb17-91" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
-<span id="cb17-92"><a href="#cb17-92" tabindex="-1"></a><span class="co">#&gt;   Rows: 6</span></span>
-<span id="cb17-93"><a href="#cb17-93" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 6</span></span>
-<span id="cb17-94"><a href="#cb17-94" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
-<span id="cb17-95"><a href="#cb17-95" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
-<span id="cb17-96"><a href="#cb17-96" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb17-97"><a href="#cb17-97" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
-<span id="cb17-98"><a href="#cb17-98" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 5</span></span>
-<span id="cb17-99"><a href="#cb17-99" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 0</span></span>
-<span id="cb17-100"><a href="#cb17-100" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
-<span id="cb17-101"><a href="#cb17-101" tabindex="-1"></a><span class="co">#&gt;   Match rate: 100%</span></span>
-<span id="cb17-102"><a href="#cb17-102" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb17-103"><a href="#cb17-103" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
-<span id="cb17-104"><a href="#cb17-104" tabindex="-1"></a><span class="co">#&gt;   inner_join: 6</span></span>
-<span id="cb17-105"><a href="#cb17-105" tabindex="-1"></a><span class="co">#&gt;   left_join: 6</span></span>
-<span id="cb17-106"><a href="#cb17-106" tabindex="-1"></a><span class="co">#&gt;   right_join: 7</span></span>
-<span id="cb17-107"><a href="#cb17-107" tabindex="-1"></a><span class="co">#&gt;   full_join: 7</span></span>
-<span id="cb17-108"><a href="#cb17-108" tabindex="-1"></a><span class="co">#&gt; </span></span>
-<span id="cb17-109"><a href="#cb17-109" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
-<span id="cb17-110"><a href="#cb17-110" tabindex="-1"></a><span class="co">#&gt;   duplicates: 1</span></span>
-<span id="cb17-111"><a href="#cb17-111" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
-<span id="cb17-112"><a href="#cb17-112" tabindex="-1"></a></span>
-<span id="cb17-113"><a href="#cb17-113" tabindex="-1"></a><span class="co"># --- Cleanup ---</span></span>
-<span id="cb17-114"><a href="#cb17-114" tabindex="-1"></a><span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
-<span id="cb17-115"><a href="#cb17-115" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging disabled</span></span>
-<span id="cb17-116"><a href="#cb17-116" tabindex="-1"></a><span class="fu">unlink</span>(pipeline_log)</span></code></pre></div>
-<p>The three gates catch different failure modes:
-<code>key_check()</code> catches string-level problems and attempts
-repair, <code>detect_cardinality()</code> halts on unexpected
-many-to-many relationships, and the row count check guards against
-anything the first two gates missed. Logging runs throughout because
-<code>set_log_file()</code> was called at the top. The structure scales
-– more tables, more gates, more joins, same pattern.</p>
+<div class="sourceCode" id="cb37"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb37-1"><a href="#cb37-1" tabindex="-1"></a><span class="co"># ============================================================</span></span>
+<span id="cb37-2"><a href="#cb37-2" tabindex="-1"></a><span class="co"># Nightly order enrichment pipeline</span></span>
+<span id="cb37-3"><a href="#cb37-3" tabindex="-1"></a><span class="co"># ============================================================</span></span>
+<span id="cb37-4"><a href="#cb37-4" tabindex="-1"></a></span>
+<span id="cb37-5"><a href="#cb37-5" tabindex="-1"></a><span class="co"># --- Setup logging ---</span></span>
+<span id="cb37-6"><a href="#cb37-6" tabindex="-1"></a>pipeline_log <span class="ot">&lt;-</span> <span class="fu">tempfile</span>(<span class="at">fileext =</span> <span class="st">&quot;.log&quot;</span>)</span>
+<span id="cb37-7"><a href="#cb37-7" tabindex="-1"></a><span class="fu">set_log_file</span>(pipeline_log, <span class="at">format =</span> <span class="st">&quot;text&quot;</span>)</span>
+<span id="cb37-8"><a href="#cb37-8" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging enabled: &#39;C:\Users\GILLES~1\AppData\Local\Temp\RtmpGsFaTd\fileac28362da32.log&#39;</span></span>
+<span id="cb37-9"><a href="#cb37-9" tabindex="-1"></a></span>
+<span id="cb37-10"><a href="#cb37-10" tabindex="-1"></a><span class="co"># --- Load data (simulated) ---</span></span>
+<span id="cb37-11"><a href="#cb37-11" tabindex="-1"></a>orders <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb37-12"><a href="#cb37-12" tabindex="-1"></a>  <span class="at">order_id =</span> <span class="dv">1</span><span class="sc">:</span><span class="dv">6</span>,</span>
+<span id="cb37-13"><a href="#cb37-13" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C001&quot;</span>, <span class="st">&quot;C002 &quot;</span>, <span class="st">&quot;C003&quot;</span>, <span class="st">&quot;C003&quot;</span>, <span class="st">&quot;C004&quot;</span>, <span class="st">&quot;C005&quot;</span>),</span>
+<span id="cb37-14"><a href="#cb37-14" tabindex="-1"></a>  <span class="at">amount =</span> <span class="fu">c</span>(<span class="dv">150</span>, <span class="dv">230</span>, <span class="dv">89</span>, <span class="dv">410</span>, <span class="dv">320</span>, <span class="dv">175</span>),</span>
+<span id="cb37-15"><a href="#cb37-15" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb37-16"><a href="#cb37-16" tabindex="-1"></a>)</span>
+<span id="cb37-17"><a href="#cb37-17" tabindex="-1"></a></span>
+<span id="cb37-18"><a href="#cb37-18" tabindex="-1"></a>customers <span class="ot">&lt;-</span> <span class="fu">data.frame</span>(</span>
+<span id="cb37-19"><a href="#cb37-19" tabindex="-1"></a>  <span class="at">customer_id =</span> <span class="fu">c</span>(<span class="st">&quot;C001&quot;</span>, <span class="st">&quot;C002&quot;</span>, <span class="st">&quot;C003&quot;</span>, <span class="st">&quot;C004&quot;</span>, <span class="st">&quot;C005&quot;</span>, <span class="st">&quot;C006&quot;</span>),</span>
+<span id="cb37-20"><a href="#cb37-20" tabindex="-1"></a>  <span class="at">name =</span> <span class="fu">c</span>(<span class="st">&quot;Acme Corp&quot;</span>, <span class="st">&quot;Globex&quot;</span>, <span class="st">&quot;Initech&quot;</span>, <span class="st">&quot;Umbrella&quot;</span>, <span class="st">&quot;Soylent&quot;</span>, <span class="st">&quot;Wonka&quot;</span>),</span>
+<span id="cb37-21"><a href="#cb37-21" tabindex="-1"></a>  <span class="at">tier =</span> <span class="fu">c</span>(<span class="st">&quot;gold&quot;</span>, <span class="st">&quot;silver&quot;</span>, <span class="st">&quot;gold&quot;</span>, <span class="st">&quot;bronze&quot;</span>, <span class="st">&quot;silver&quot;</span>, <span class="st">&quot;gold&quot;</span>),</span>
+<span id="cb37-22"><a href="#cb37-22" tabindex="-1"></a>  <span class="at">stringsAsFactors =</span> <span class="cn">FALSE</span></span>
+<span id="cb37-23"><a href="#cb37-23" tabindex="-1"></a>)</span>
+<span id="cb37-24"><a href="#cb37-24" tabindex="-1"></a></span>
+<span id="cb37-25"><a href="#cb37-25" tabindex="-1"></a><span class="co"># --- Gate 1: key quality assertion ---</span></span>
+<span id="cb37-26"><a href="#cb37-26" tabindex="-1"></a>keys_ok <span class="ot">&lt;-</span> <span class="fu">key_check</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb37-27"><a href="#cb37-27" tabindex="-1"></a></span>
+<span id="cb37-28"><a href="#cb37-28" tabindex="-1"></a><span class="cf">if</span> (<span class="sc">!</span>keys_ok) {</span>
+<span id="cb37-29"><a href="#cb37-29" tabindex="-1"></a>  <span class="fu">message</span>(<span class="st">&quot;Key issues detected -- attempting repair&quot;</span>)</span>
+<span id="cb37-30"><a href="#cb37-30" tabindex="-1"></a>  repaired <span class="ot">&lt;-</span> <span class="fu">join_repair</span>(</span>
+<span id="cb37-31"><a href="#cb37-31" tabindex="-1"></a>    orders, customers,</span>
+<span id="cb37-32"><a href="#cb37-32" tabindex="-1"></a>    <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>,</span>
+<span id="cb37-33"><a href="#cb37-33" tabindex="-1"></a>    <span class="at">trim_whitespace =</span> <span class="cn">TRUE</span>,</span>
+<span id="cb37-34"><a href="#cb37-34" tabindex="-1"></a>    <span class="at">remove_invisible =</span> <span class="cn">TRUE</span></span>
+<span id="cb37-35"><a href="#cb37-35" tabindex="-1"></a>  )</span>
+<span id="cb37-36"><a href="#cb37-36" tabindex="-1"></a>  orders <span class="ot">&lt;-</span> repaired<span class="sc">$</span>x</span>
+<span id="cb37-37"><a href="#cb37-37" tabindex="-1"></a>  customers <span class="ot">&lt;-</span> repaired<span class="sc">$</span>y</span>
+<span id="cb37-38"><a href="#cb37-38" tabindex="-1"></a>}</span>
+<span id="cb37-39"><a href="#cb37-39" tabindex="-1"></a><span class="co">#&gt; Key issues detected -- attempting repair</span></span>
+<span id="cb37-40"><a href="#cb37-40" tabindex="-1"></a><span class="co">#&gt; ✔ Repaired 1 value(s)</span></span>
+<span id="cb37-41"><a href="#cb37-41" tabindex="-1"></a></span>
+<span id="cb37-42"><a href="#cb37-42" tabindex="-1"></a><span class="co"># --- Gate 2: cardinality check ---</span></span>
+<span id="cb37-43"><a href="#cb37-43" tabindex="-1"></a>card <span class="ot">&lt;-</span> <span class="fu">detect_cardinality</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>)</span>
+<span id="cb37-44"><a href="#cb37-44" tabindex="-1"></a><span class="co">#&gt; ℹ Detected cardinality: &quot;n:1&quot;</span></span>
+<span id="cb37-45"><a href="#cb37-45" tabindex="-1"></a><span class="co">#&gt; Left duplicates: 1 key(s)</span></span>
+<span id="cb37-46"><a href="#cb37-46" tabindex="-1"></a><span class="cf">if</span> (card <span class="sc">==</span> <span class="st">&quot;n:m&quot;</span>) {</span>
+<span id="cb37-47"><a href="#cb37-47" tabindex="-1"></a>  <span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
+<span id="cb37-48"><a href="#cb37-48" tabindex="-1"></a>  <span class="fu">unlink</span>(pipeline_log)</span>
+<span id="cb37-49"><a href="#cb37-49" tabindex="-1"></a>  <span class="fu">stop</span>(<span class="st">&quot;Unexpected n:m cardinality in orders-customers join&quot;</span>, <span class="at">call. =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb37-50"><a href="#cb37-50" tabindex="-1"></a>}</span>
+<span id="cb37-51"><a href="#cb37-51" tabindex="-1"></a></span>
+<span id="cb37-52"><a href="#cb37-52" tabindex="-1"></a><span class="co"># --- Join (with auto-logging via *_join_spy) ---</span></span>
+<span id="cb37-53"><a href="#cb37-53" tabindex="-1"></a>enriched <span class="ot">&lt;-</span> <span class="fu">left_join_spy</span>(orders, customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb37-54"><a href="#cb37-54" tabindex="-1"></a></span>
+<span id="cb37-55"><a href="#cb37-55" tabindex="-1"></a><span class="co"># --- Gate 3: row count sanity check ---</span></span>
+<span id="cb37-56"><a href="#cb37-56" tabindex="-1"></a><span class="co"># A left join should never lose rows from the left table</span></span>
+<span id="cb37-57"><a href="#cb37-57" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">nrow</span>(enriched) <span class="sc">&lt;</span> <span class="fu">nrow</span>(orders)) {</span>
+<span id="cb37-58"><a href="#cb37-58" tabindex="-1"></a>  <span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
+<span id="cb37-59"><a href="#cb37-59" tabindex="-1"></a>  <span class="fu">unlink</span>(pipeline_log)</span>
+<span id="cb37-60"><a href="#cb37-60" tabindex="-1"></a>  <span class="fu">stop</span>(<span class="st">&quot;Row count decreased after left join -- possible data corruption&quot;</span>,</span>
+<span id="cb37-61"><a href="#cb37-61" tabindex="-1"></a>       <span class="at">call. =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb37-62"><a href="#cb37-62" tabindex="-1"></a>}</span>
+<span id="cb37-63"><a href="#cb37-63" tabindex="-1"></a></span>
+<span id="cb37-64"><a href="#cb37-64" tabindex="-1"></a><span class="co"># --- Output ---</span></span>
+<span id="cb37-65"><a href="#cb37-65" tabindex="-1"></a><span class="fu">message</span>(<span class="fu">sprintf</span>(<span class="st">&quot;Pipeline complete: %d enriched orders&quot;</span>, <span class="fu">nrow</span>(enriched)))</span>
+<span id="cb37-66"><a href="#cb37-66" tabindex="-1"></a><span class="co">#&gt; Pipeline complete: 6 enriched orders</span></span>
+<span id="cb37-67"><a href="#cb37-67" tabindex="-1"></a><span class="fu">head</span>(enriched)</span>
+<span id="cb37-68"><a href="#cb37-68" tabindex="-1"></a><span class="co">#&gt;   customer_id order_id amount      name   tier</span></span>
+<span id="cb37-69"><a href="#cb37-69" tabindex="-1"></a><span class="co">#&gt; 1        C001        1    150 Acme Corp   gold</span></span>
+<span id="cb37-70"><a href="#cb37-70" tabindex="-1"></a><span class="co">#&gt; 2        C002        2    230    Globex silver</span></span>
+<span id="cb37-71"><a href="#cb37-71" tabindex="-1"></a><span class="co">#&gt; 3        C003        3     89   Initech   gold</span></span>
+<span id="cb37-72"><a href="#cb37-72" tabindex="-1"></a><span class="co">#&gt; 4        C003        4    410   Initech   gold</span></span>
+<span id="cb37-73"><a href="#cb37-73" tabindex="-1"></a><span class="co">#&gt; 5        C004        5    320  Umbrella bronze</span></span>
+<span id="cb37-74"><a href="#cb37-74" tabindex="-1"></a><span class="co">#&gt; 6        C005        6    175   Soylent silver</span></span>
+<span id="cb37-75"><a href="#cb37-75" tabindex="-1"></a></span>
+<span id="cb37-76"><a href="#cb37-76" tabindex="-1"></a><span class="co"># --- Review the log ---</span></span>
+<span id="cb37-77"><a href="#cb37-77" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">file.exists</span>(pipeline_log)) {</span>
+<span id="cb37-78"><a href="#cb37-78" tabindex="-1"></a>  <span class="fu">cat</span>(<span class="fu">readLines</span>(pipeline_log), <span class="at">sep =</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span>
+<span id="cb37-79"><a href="#cb37-79" tabindex="-1"></a>}</span>
+<span id="cb37-80"><a href="#cb37-80" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-81"><a href="#cb37-81" tabindex="-1"></a><span class="co">#&gt; Logged: 2026-06-13 01:39:41</span></span>
+<span id="cb37-82"><a href="#cb37-82" tabindex="-1"></a><span class="co">#&gt; ------------------------------------------------------------</span></span>
+<span id="cb37-83"><a href="#cb37-83" tabindex="-1"></a><span class="co">#&gt; Join Key: customer_id</span></span>
+<span id="cb37-84"><a href="#cb37-84" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-85"><a href="#cb37-85" tabindex="-1"></a><span class="co">#&gt; Left Table (x):</span></span>
+<span id="cb37-86"><a href="#cb37-86" tabindex="-1"></a><span class="co">#&gt;   Rows: 6</span></span>
+<span id="cb37-87"><a href="#cb37-87" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 5</span></span>
+<span id="cb37-88"><a href="#cb37-88" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 1</span></span>
+<span id="cb37-89"><a href="#cb37-89" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb37-90"><a href="#cb37-90" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-91"><a href="#cb37-91" tabindex="-1"></a><span class="co">#&gt; Right Table (y):</span></span>
+<span id="cb37-92"><a href="#cb37-92" tabindex="-1"></a><span class="co">#&gt;   Rows: 6</span></span>
+<span id="cb37-93"><a href="#cb37-93" tabindex="-1"></a><span class="co">#&gt;   Unique keys: 6</span></span>
+<span id="cb37-94"><a href="#cb37-94" tabindex="-1"></a><span class="co">#&gt;   Duplicated keys: 0</span></span>
+<span id="cb37-95"><a href="#cb37-95" tabindex="-1"></a><span class="co">#&gt;   NA keys: 0</span></span>
+<span id="cb37-96"><a href="#cb37-96" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-97"><a href="#cb37-97" tabindex="-1"></a><span class="co">#&gt; Match Analysis:</span></span>
+<span id="cb37-98"><a href="#cb37-98" tabindex="-1"></a><span class="co">#&gt;   Keys in both: 5</span></span>
+<span id="cb37-99"><a href="#cb37-99" tabindex="-1"></a><span class="co">#&gt;   Keys only in left: 0</span></span>
+<span id="cb37-100"><a href="#cb37-100" tabindex="-1"></a><span class="co">#&gt;   Keys only in right: 1</span></span>
+<span id="cb37-101"><a href="#cb37-101" tabindex="-1"></a><span class="co">#&gt;   Match rate: 100%</span></span>
+<span id="cb37-102"><a href="#cb37-102" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-103"><a href="#cb37-103" tabindex="-1"></a><span class="co">#&gt; Expected Rows:</span></span>
+<span id="cb37-104"><a href="#cb37-104" tabindex="-1"></a><span class="co">#&gt;   inner_join: 6</span></span>
+<span id="cb37-105"><a href="#cb37-105" tabindex="-1"></a><span class="co">#&gt;   left_join: 6</span></span>
+<span id="cb37-106"><a href="#cb37-106" tabindex="-1"></a><span class="co">#&gt;   right_join: 7</span></span>
+<span id="cb37-107"><a href="#cb37-107" tabindex="-1"></a><span class="co">#&gt;   full_join: 7</span></span>
+<span id="cb37-108"><a href="#cb37-108" tabindex="-1"></a><span class="co">#&gt; </span></span>
+<span id="cb37-109"><a href="#cb37-109" tabindex="-1"></a><span class="co">#&gt; Issues Detected: 1</span></span>
+<span id="cb37-110"><a href="#cb37-110" tabindex="-1"></a><span class="co">#&gt;   duplicates: 1</span></span>
+<span id="cb37-111"><a href="#cb37-111" tabindex="-1"></a><span class="co">#&gt; ============================================================</span></span>
+<span id="cb37-112"><a href="#cb37-112" tabindex="-1"></a></span>
+<span id="cb37-113"><a href="#cb37-113" tabindex="-1"></a><span class="co"># --- Cleanup ---</span></span>
+<span id="cb37-114"><a href="#cb37-114" tabindex="-1"></a><span class="fu">set_log_file</span>(<span class="cn">NULL</span>)</span>
+<span id="cb37-115"><a href="#cb37-115" tabindex="-1"></a><span class="co">#&gt; ℹ Automatic logging disabled</span></span>
+<span id="cb37-116"><a href="#cb37-116" tabindex="-1"></a><span class="fu">unlink</span>(pipeline_log)</span></code></pre></div>
+<p>The three gates catch different failure modes. Gate 1 catches
+string-level problems and repairs the mechanical ones; in this run it
+finds the padded <code>&quot;C002 &quot;</code> and trims it, so that customer
+keeps its name and tier in the enriched output. Gate 2 halts on the one
+structural problem repair cannot touch: an unexpected many-to-many
+relationship, the kind that multiplies rows. Gate 3 is the catch-all – a
+left join returning fewer rows than its left table means something went
+wrong at a level the key diagnostics do not see, such as an upstream
+filter applied to the wrong object. Logging runs throughout because
+<code>set_log_file()</code> was called at the top, so even a run that
+dies at gate 3 leaves a record of the join that preceded the death.</p>
+<p>Equally deliberate is what the pattern does not check. It never
+verifies that <code>customer_id</code> is the right column to join on; a
+clean key on the wrong column passes every gate. It enforces no
+match-rate floor, so orders for customers missing from the reference
+table sail through with <code>NA</code> names – adding a fourth gate on
+<code>last_report()$match_analysis$match_rate</code> covers that case
+when unmatched keys count as failures for the job at hand. And it
+validates keys only: a corrupted <code>amount</code> column is invisible
+to every check here, which is why these gates complement value-level
+validation tools rather than replace them.</p>
+<p>The pattern stops scaling somewhere around a dozen joins. At that
+point the gate blocks become copy-paste boilerplate, the thresholds
+belong in a config file, and the per-join logic wants to be a function
+taking two tables, a key, and an expected cardinality. Past that, a
+pipeline framework such as <code>targets</code> is the better skeleton,
+with these same checks living inside each node. The log file also grows
+without bound under a daily schedule; naming it by date
+(<code>sprintf(&quot;enrich-%s.log&quot;, Sys.Date())</code>) keeps each day’s
+audit trail separate and bounded.</p>
+</div>
+<div id="the-cost-of-diagnostics" class="section level2">
+<h2>The Cost of Diagnostics</h2>
+<p>Every gate adds runtime, and on a 50,000-row join it is worth seeing
+how much. We time the bare join, the instrumented wrapper, and the cheap
+gate on the tables from the sampling section:</p>
+<div class="sourceCode" id="cb38"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb38-1"><a href="#cb38-1" tabindex="-1"></a>t_merge <span class="ot">&lt;-</span> <span class="fu">system.time</span>(</span>
+<span id="cb38-2"><a href="#cb38-2" tabindex="-1"></a>  <span class="fu">merge</span>(big_orders, big_customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">all.x =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb38-3"><a href="#cb38-3" tabindex="-1"></a>)</span>
+<span id="cb38-4"><a href="#cb38-4" tabindex="-1"></a>t_spy <span class="ot">&lt;-</span> <span class="fu">system.time</span>(</span>
+<span id="cb38-5"><a href="#cb38-5" tabindex="-1"></a>  <span class="fu">left_join_spy</span>(big_orders, big_customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">.quiet =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb38-6"><a href="#cb38-6" tabindex="-1"></a>)</span>
+<span id="cb38-7"><a href="#cb38-7" tabindex="-1"></a>t_check <span class="ot">&lt;-</span> <span class="fu">system.time</span>(</span>
+<span id="cb38-8"><a href="#cb38-8" tabindex="-1"></a>  <span class="fu">key_check</span>(big_orders, big_customers, <span class="at">by =</span> <span class="st">&quot;customer_id&quot;</span>, <span class="at">warn =</span> <span class="cn">FALSE</span>)</span>
+<span id="cb38-9"><a href="#cb38-9" tabindex="-1"></a>)</span>
+<span id="cb38-10"><a href="#cb38-10" tabindex="-1"></a></span>
+<span id="cb38-11"><a href="#cb38-11" tabindex="-1"></a><span class="fu">rbind</span>(<span class="at">merge =</span> t_merge, <span class="at">left_join_spy =</span> t_spy, <span class="at">key_check =</span> t_check)[, <span class="dv">1</span><span class="sc">:</span><span class="dv">3</span>]</span>
+<span id="cb38-12"><a href="#cb38-12" tabindex="-1"></a><span class="co">#&gt;               user.self sys.self elapsed</span></span>
+<span id="cb38-13"><a href="#cb38-13" tabindex="-1"></a><span class="co">#&gt; merge              0.09     0.00    0.09</span></span>
+<span id="cb38-14"><a href="#cb38-14" tabindex="-1"></a><span class="co">#&gt; left_join_spy      0.51     0.03    0.58</span></span>
+<span id="cb38-15"><a href="#cb38-15" tabindex="-1"></a><span class="co">#&gt; key_check          0.03     0.00    0.01</span></span></code></pre></div>
+<p>The gap between <code>merge()</code> and <code>left_join_spy()</code>
+is the full diagnostic: key summaries, match analysis, row-count
+prediction, and the string scans. The scans are vectorized, and the one
+quadratic piece – near-match detection – is capped at 50 unmatched keys
+against 100 candidates regardless of table size, so the diagnostic cost
+grows roughly linearly with the number of unique keys.
+<code>key_check()</code> runs the cheap subset only, which is why it can
+sit in front of every join in a script.</p>
+<p>When the elapsed column stops looking ignorable – tables in the tens
+of millions of rows, or a join inside a tight loop – the fallback order
+is: keep <code>key_check()</code> on every run, move the full
+<code>join_spy()</code> diagnostic to a <code>sample =</code> run, and
+reserve the unsampled analysis for a weekly job or for the morning after
+an alert. The numbers above are the budget conversation in miniature:
+the gate costs a fraction of the join it protects, and the sampling
+section shows how to hold that fraction steady as the tables grow.</p>
 </div>
 
 

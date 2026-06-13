@@ -59,6 +59,13 @@ class(result_dt)
 mixed_result <- left_join_spy(orders_dt, customers_tbl, by = "id", .quiet = TRUE)
 class(mixed_result)
 
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+accounts <- data.frame(id = c(1, 2), balance = c(50, 80))
+holders <- data.frame(account_key = c(1, 2), holder = c("Ana", "Ben"))
+
+names(left_join_spy(accounts, holders, by = c("id" = "account_key"),
+                    backend = "data.table", .quiet = TRUE))
+
 ## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
 result <- left_join_spy(orders_df, customers_df, by = "id",
                         backend = "dplyr", .quiet = TRUE)
@@ -76,10 +83,14 @@ prices <- dplyr::tibble(
   currency = c("USD", "USD", "EUR")
 )
 
-# Force base R to avoid dplyr's many-to-many warning
-result <- left_join_spy(tags, prices, by = "item_id",
-                        backend = "base", .quiet = TRUE)
+result <- left_join_spy(tags, prices, by = "item_id", .quiet = TRUE)
 nrow(result)
+
+## ----error = TRUE, eval = requireNamespace("dplyr", quietly = TRUE)-----------
+try({
+left_join_spy(tags, prices, by = "item_id", .quiet = TRUE,
+              relationship = "one-to-one")
+})
 
 ## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
 result <- left_join_spy(orders_df, customers_df, by = "id",
@@ -147,6 +158,96 @@ joined_dt <- left_join_spy(repaired_dt, lookup_dt, by = "code", .quiet = TRUE)
 class(joined_dt)  # still data.table
 joined_dt
 
+## -----------------------------------------------------------------------------
+dup_left <- data.frame(id = c(1, 2), status = c("open", "closed"))
+dup_right <- data.frame(id = c(1, 2), status = c("new", "old"))
+
+names(left_join_spy(dup_left, dup_right, by = "id", .quiet = TRUE))
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
+names(left_join_spy(dup_left, dup_right, by = "id",
+                    backend = "dplyr", .quiet = TRUE))
+
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+names(left_join_spy(dup_left, dup_right, by = "id",
+                    backend = "data.table", .quiet = TRUE))
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
+names(left_join_spy(dup_left, dup_right, by = "id", backend = "dplyr",
+                    .quiet = TRUE, suffix = c("_current", "_incoming")))
+
+## -----------------------------------------------------------------------------
+lhs <- data.frame(id = c(3, 1, 2), amount = c(30, 10, 20))
+rhs <- data.frame(id = c(1, 2, 3), name = c("a", "b", "c"))
+
+left_join_spy(lhs, rhs, by = "id", .quiet = TRUE)$id
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
+left_join_spy(lhs, rhs, by = "id", backend = "dplyr", .quiet = TRUE)$id
+
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+left_join_spy(lhs, rhs, by = "id", backend = "data.table", .quiet = TRUE)$id
+
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+left_join_spy(lhs, rhs, by = "id", backend = "data.table",
+              .quiet = TRUE, sort = FALSE)$id
+
+## -----------------------------------------------------------------------------
+na_left <- data.frame(code = c("A", NA), v = c(1, 2))
+na_right <- data.frame(code = c("A", NA), label = c("alpha", "missing"))
+
+nrow(inner_join_spy(na_left, na_right, by = "code", .quiet = TRUE))
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
+nrow(inner_join_spy(na_left, na_right, by = "code",
+                    backend = "dplyr", .quiet = TRUE))
+
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+inner_join_spy(na_left, na_right, by = "code",
+               backend = "data.table", .quiet = TRUE)
+
+## -----------------------------------------------------------------------------
+report <- join_spy(na_left, na_right, by = "code")
+report$expected_rows$inner
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
+nrow(inner_join_spy(na_left, na_right, by = "code", backend = "dplyr",
+                    .quiet = TRUE, na_matches = "never"))
+
+## -----------------------------------------------------------------------------
+nrow(inner_join_spy(na_left, na_right, by = "code", backend = "base",
+                    .quiet = TRUE, incomparables = NA))
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE)-------------------------
+invisible(left_join_spy(orders_df, customers_df, by = "id",
+                        backend = "base", .quiet = TRUE))
+report_base <- last_report()
+
+invisible(left_join_spy(orders_df, customers_df, by = "id",
+                        backend = "dplyr", .quiet = TRUE))
+report_dplyr <- last_report()
+
+identical(report_base$expected_rows, report_dplyr$expected_rows)
+
+## -----------------------------------------------------------------------------
+result <- left_join_spy(orders_df, customers_df, by = "id", .quiet = TRUE)
+is_join_report(attr(result, "join_report"))
+
+## ----error = TRUE-------------------------------------------------------------
+try({
+products <- data.frame(id = 1:3, product = c("A", "B", "C"))
+suppliers_dup <- data.frame(id = c(1, 1, 2), name = c("S1", "S2", "S3"))
+
+join_strict(products, suppliers_dup, by = "id", expect = "1:1",
+            backend = "data.table")
+})
+
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+products_dt <- data.table::data.table(id = 1:3, product = c("A", "B", "C"))
+suppliers_dt <- data.table::data.table(id = 1:3, name = c("S1", "S2", "S3"))
+
+class(join_strict(products_dt, suppliers_dt, by = "id", expect = "1:1"))
+
 ## ----eval = requireNamespace("data.table", quietly = TRUE) && requireNamespace("dplyr", quietly = TRUE)----
 # Diagnose on data.tables
 orders_dt <- data.table::data.table(
@@ -166,4 +267,25 @@ orders_tbl <- dplyr::as_tibble(orders_dt)
 customers_tbl <- dplyr::as_tibble(customers_dt)
 result <- left_join_spy(orders_tbl, customers_tbl, by = "id", .quiet = TRUE)
 class(result)
+
+## ----eval = requireNamespace("dplyr", quietly = TRUE) && requireNamespace("data.table", quietly = TRUE)----
+set.seed(42)
+n <- 5000
+big_x <- data.frame(id = sample(n), x = rnorm(n))
+big_y <- data.frame(id = sample(n), y = rnorm(n))
+
+t_base <- system.time(left_join_spy(big_x, big_y, by = "id",
+                                    backend = "base", .quiet = TRUE))
+t_dplyr <- system.time(left_join_spy(big_x, big_y, by = "id",
+                                     backend = "dplyr", .quiet = TRUE))
+t_dt <- system.time(left_join_spy(big_x, big_y, by = "id",
+                                  backend = "data.table", .quiet = TRUE))
+t_spy <- system.time(report <- join_spy(big_x, big_y, by = "id"))
+
+round(c(base = t_base[["elapsed"]], dplyr = t_dplyr[["elapsed"]],
+        data.table = t_dt[["elapsed"]], diagnostics = t_spy[["elapsed"]]), 3)
+
+## ----eval = requireNamespace("data.table", quietly = TRUE)--------------------
+class(left_join_spy(orders_dt, customers_dt, by = "id",
+                    backend = "base", .quiet = TRUE))
 
